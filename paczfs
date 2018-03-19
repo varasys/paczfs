@@ -1,0 +1,941 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+#TODO remove all systemd calls on host
+
+## this script is hosted at https://github.com/varasys/paczfs
+
+## execute script with "-h" option for a description of the purpose
+## of this script.
+
+## this script was designed to allow very fine grained customizations
+## of images using hook functions, and users are encouraged to
+## understand the "create-image" function to learn how the default
+## script operates so they can add to it or override it (by setting
+## handled=true)
+
+## if you have any questions, comments or patches, please raise an
+## issue on the project github page at https://github.com/varasys/paczfs
+
+## this script was originally written specifically to get zfs onto
+## archlinux as the root filesystem but it wouldn't take a lot of extra
+## effort to generalize it and allow "filesystem" plug-ins
+## if anybody is interested in this (either as a need, or a developer)
+## please raise an issue on the github page
+
+## there may be some functions nested within other functions which
+## has no technical benefit and may couse the function to be sourced
+## multiple times; but I was leaving too many orphan functions during
+## the script development and started nesting them to associate them
+## with their greater purpose (so they would be deleted during refactoring)
+
+## the hook function name following each "if fire-hook" provides
+## a good overview of what each section does and a quick reference to
+## locate a specific functionality in the script
+
+## this script was written on a large widescreen monitor and heaven
+## help the person who tries to understand it at 80 characters wide!
+
+## also, it was written on a Mac in Microsoft Code with the GitLens
+## extension (obviously this is a recommendation for anyone looking
+## for a good bash development environment); but note that it was
+## debugged on a linux vm since bash on a modern mac shell is still
+## not bash 4+ (therefore, this script may run on a mac (or windows)
+## machine under some circumstances but unless you are in linux
+## (or linux vm or container) it is just a happy coincidence
+## and becoming increasingly irrelevant
+
+## some very (very) good references (special thanks to the authors)
+## https://github.com/zfsonlinux/zfs/wiki/faq#booting-from-zfs
+## https://disconnected.systems/blog/archlinux-repo-in-a-git-repo/
+## https://disconnected.systems/blog/archlinux-meta-packages/
+## https://disconnected.systems/blog/another-bash-strict-mode/
+## https://wiki.archlinux.org/index.php/ZFS
+## https://ramsdenj.com/2016/06/23/arch-linux-on-zfs-part-1-embed-zfs-in-archiso.html
+## https://wiki.archlinux.org/index.php/Installation_guide
+## https://gist.github.com/mattiaslundberg/8620837
+## http://www.rodsbooks.com/efi-bootloaders/index.html
+
+## finally note that the comments in this script are more focused
+## on understanding the bash than the actual process because experience
+## has shown that once the bash is understood it is typically easier
+## to consult the man pages to understand the details than it is to
+## to write long explinations that have subtle exceptions
+
+## in every case, the first step is to understand how bash will expand
+## the entire line (with special emphasis on nested quoting and quoting
+## within subshels) so that you can visualize a clear understanding
+## of what the actual command line to be processed would look like
+
+## if anybody has questions on any specific section raise an issue
+## on github and i will try and prepare an explination of how it works
+## and since the whole script is "lots of the same" a good explination of
+## one section would go a long way towards understanding the rest (if
+## anybody is interested)
+
+declare -rx name="paczfs"
+declare -r version="v0.0.1"
+declare -r license="MIT"
+
+## define some utility functions
+declare -rx black='30m' red='31m' green='32m' yellow='33m' blue='34m' magenta='35m' cyan='36m' white='37m'
+declare -rx normal=$(echo -ne '\033[0;') bold=$(echo -ne '\033[1;') restore=$(echo -ne '\033[0m')
+function say() {
+	local -r usage="usage: ${FUNCNAME} <color> <colored_string> [uncolored_string]"
+	local -r color="${1:?${usage}}"
+	local -r colored_string="${2:?${usage}}"
+	shift 2
+	echo -e "${color}${colored_string}${restore}${1:+ ${*}}"
+}
+function inform() { say "${bold}${cyan}" "info: " "${@}"; }
+function warn() { say "${bold}${magenta}" "warning: " "${@}"; }
+function congrats() { say "${bold}${green}" "success: " "${@}"; }
+function die() { declare -gx err=$? lineno=${BASH_LINENO[0]}; (( err != 0 )) || err=1; error-trap "(${FUNCNAME[1]} line ${lineno}): " "${@}"; }
+function set-debug() {
+	case "${1:-${default_debug}}" in
+		none)    eval "exec ${verbose_fd}> /dev/null"; set +x; unset pacman_debug;;
+		verbose) eval "exec ${verbose_fd}>&1"; set +x; declare -gx pacman_debug=' --verbose ';;
+		trace)   eval "exec ${verbose_fd}>&1"; set -x; declare -gx pacman_debug=' --verbose --debug ';;
+		debug)   eval "exec ${verbose_fd}>&1"; declare -g err_cmd=bash; set -x; declare -gx pacman_debug=' --verbose --debug ';;
+		*) die "invalid option to -d \"(none|verbose|trace|debug)\"";;
+	esac
+}
+
+## utility functions for a "tear down stack" to restore the system
+function add-tear-down() { 
+	if ! declare -p tear_down_stack &> "/dev/null"; then
+		declare -ga tear_down_stack=( )
+		trap 'tear-down' EXIT
+	fi
+	tear_down_stack+=( "${1}" )
+}
+function tear-down() {
+	if declare -p tear_down_stack &> "/dev/null"; then
+		local -i count=${1:-${#tear_down_stack[@]}}
+		for index in $( printf "%s\n" "${!tear_down_stack[@]}" | sort -rn ); do
+			echo "tear down ${index}: ${tear_down_stack[${index}]}" >&${verbose_fd}
+			eval "${tear_down_stack[${index}]}"
+			unset tear_down_stack[${index}]
+			(( --count == 0 )) && return
+		done
+	fi
+}
+
+## redefine bash to provide custom PS1 (to prevent confusion during debugging)
+function bash() {
+	say "${bold}${red}" "error $?: opening interactive shell (use \"exit 1\" to quit or \"exit 0\" to continue script execution)"
+	$( which bash ) --rcfile <( cat <<-EOF
+			err=$?
+			export PS1="\[$(tput bold)\]\[$(tput setaf 5)\]\${hook:-\${name:-\${0}}}\[$(tput bold)\]\[$(tput setaf 1)\]\${lineno:+ (line \${lineno})}\[$(tput sgr0)\]\[$(tput setaf 5)\] \w \\$ \[$(tput sgr0)\]"
+			( exit ${err:-0} ) # do this to reset the error code
+			EOF
+		) -i -- "${@}"
+}
+
+## set up some error handling
+exec {verbose_fd}> "/dev/null"
+declare -rx PS4="> Line \${LINENO}: " # change default debugging prompt to show script line numbers
+function error-trap() { # do not call this function directly (it should only be called by the ERR trap or die function)
+	(
+		local msg="error: ${1}"
+		shift
+		( say "${bold}${red}" "${msg}" "${*}"; exit ${err} ) # use sub-shell to "re-throw" err status
+		eval ${err_cmd:-exit ${err}}
+	) || exit ${?}
+	unset err lineno
+}
+declare -fx error-trap bash
+trap 'declare -gx err=$?; error-trap "(${BASH_FUNCTION:-${0}} line ${LINENO}): ";' ERR # do NOT use "set -e" otherwise this has no effect (I think)
+trap 'declare -gx err=1; error-trap "received SIGINT";' INT # trap ctrl-c from keyboard
+
+function print-help() {
+	[[ -t 1 ]] && local -r viewer=$( which less 2> /dev/null || echo cat ) ||  -r viewer=cat
+	${viewer} <<-EOF
+		${name} (${version}) Copyright 2018 Varasys Limited (${license} License)
+
+		pacstrap (bootstsrap) and customize ArchLinux server images with OpenZFS root 
+		filesystem (see https://github.com/varasys/${name} for more documentation).
+
+		This script installs an ArchLinux image using ZFS for the root filesystem on
+		a block device or to an image file (raw/img, vdi, qcow, qcow2) along with a
+		GPT partition table, EFI partition, and swap volume partition. In other words
+		it should boot up on any machine which uses EFI to boot. Patches are welcome
+		from anybody who knows how to make it boot on BIOS machines (it should not be
+		hard, but I'm exhausted at this point and I only need EFI).
+
+		The benefit of ZFS is that it combines the best parts of a Copy On Write (COW)
+		filesystem (ie. instant snapshots and clones) with differential backup
+		capabilities. ZFS has an extremely effecient mechanism for transferring bitwise
+		differentials between snapshots without having to actually scan the filesystem
+		(similar, but with a very different underlying mechanism, to rsync except at
+		the "ZFS dataset" level instead of the file level).
+
+		If you just want to use ZFS for your data, there is no need to use this script.
+		This script specifically sets up ZFS as the root filesystem (ie. "/"). The
+		practical benefit of this is being able to snapshot and revert to previous
+		or multiple other root filesystems with reboot (good for development) and being
+		able to effeciently distribute root filesystem updates (good for transitioning
+		production systems during upgrades). There are, of course, several alternative
+		ways of achieving these goals and this is just a test bed to test the concept.
+		Also, this probably has more benefit as a "hypervisor-like" headless VPS server
+		than on a laptop OS (something like VirtualBox is likely much more appropriate
+		for OS snapshotting and cloning on a laptop).
+
+		This script is the result of adopting the CoreOS updating strategy without the
+		CoreOS limitations. It is envisioned that to create a production server image
+		you would first use this script to create a "development image" to use to
+		set-up the server exactly as needed (with the benefit of bash-completion,
+		manual documents, and other utilities not strictly needed in the production
+		server). You can "boot" your test production server using systemd-nspawn. When
+		you are happy with it use "zpool set bootfs=zroot/system/new_image zroot"
+		(adjusting as necessary to match the actual dataset and zpool name), and then
+		reboot. After rebooting you can delete the original boot dataset (resulting in
+		a bare bones customized OS image). Updates to production images can then be
+		distributed as ZFS differential snapshots (using zfs send/receive). The default
+		configuration includes seperate datasets for /home /root /srv /var/lib/machines
+		and /var/lib/postgresql (so these will be the same no matter which root
+		filesystem you are booted into). Use the "create-zfs-datasets" hook function
+		to override this default configuration (see below).
+
+		systemd-nspawn has some built-in functionality to use btrfs as a backing
+		filesystem for containers (in the /var/lib/machines directory) which allows
+		cloning and snapshotting, but we were never confortable with btrfs the same
+		way we are with zfs (but we also don't have much btrfs experience). But
+		for the purposes of managing containers in an image created from this script,
+		you can create a container directory with:
+			"zfs create zroot/machines/new_container"
+		snapshot a container directory with:
+			"zfs snapshot zroot/machines/new_container@snap_name"
+		or clone a container directory with
+			"zfs clone zroot/machines/new_container@snap_name zroot/machines/clone_container"
+
+		The image may be customized by setting environment variables and/or defining
+		hook functions which run at pre-determined times while the image is being
+		created (refer to configuration section). A very common example is to use a
+		hook function to copy ssh authorized_keys to the image, or to disable root
+		password login (the default image has an empty password for root). The default
+		configuration file (${name} -C > config_file) includes a list of all available
+		hook functions commented out. To use a hook function, uncomment it, and then
+		define whatever script actions you require.
+
+		## USAGE (also read configuration):
+		Create a new image using default configuration and no options (will create .img
+		file in current directory):
+			${name}
+
+		Create a new VirtualBox image (vdi format) based on the default configuration:
+			VDI_FILE='./\${SUFFIX}.vdi' ${name}
+
+		Create a new configuration template file (optionally based on an existing 
+		configuration file):
+			${name} [-c old_config] -C > new_config
+
+		Troubleshoot creating a new image (-v is same as "-d verbose -e bash" and
+		provides reasonable output and drops into a shell on errors):
+			${name} [-d none|verbose|debug] [-v] [-e error_cmd] [-c config_file]
+
+		Show help:
+			${name} -h
+
+		Show version:
+			${name} -V
+
+		## CONFIGURATION
+		If a configuration file is provided it is sourced before script execution. This
+		has the same effect as literally cutting and pasting the config file into
+		the script. The point is that: 1) the config file uses bash syntax, and 2) the
+		config file is sourced (or included into this script) during execution.
+
+		The config file is used to set environment variables and define "hook
+		functions", which are user defined functions which are run at pre-determined times
+		throughout the image creation (see below).
+
+		The command line options to ${name} only control debug and configuration settings.
+		Environment variables are used to configure the final image. The environment
+		variables may be set on the command line prior to executing ${name}, or can be set
+		in the config file (initially created with "${name} -C > out_file"). The priority
+		of variables is the config file first, command line second, and defaults third. The
+		second example above (creating an image for VirtualBox) demonstrates setting the
+		environment variables on the command line (VDI_FILE is set prior to executing
+		${name}).
+
+		In addition to defining environment variables, hook functions may be defined in
+		the configuration file. "Hook functions" are functions which are functions which
+		the script will execute if they are defined in the config file. The default
+		configuration template has some examples (commented out) of hook functions
+		to copy ssh keys and set the default keyboard layout.
+
+		Run "${name} -C" to see a configuration file template listing the applicable
+		environment variables and hook functions. Uncomment and adjust the variables
+		and hook functions as needed.
+
+		Note that ${name} will "evaluate" each variable (using eval), so it is okay to
+		"embed" other variables in single quotes (ie. VDI_FILE='\${SUFFIX}.vdi'). The
+		single quotes will prevent the shell from expanding the variable (but ${name}
+		will still expand it when needed, which is typically after the referenced
+		variable has been set).
+
+		To see when each hook function will be executed scan the script for lines that
+		say 'if fire-hook ' which will fire the hook listed in the if statement. You
+		can prevent the pre-defined code from executing by setting "handled=true" in
+		the hook function (in which case you are responsible for ensuring that
+		everything that is required in that section is performed in your hook function).
+
+		When exploring the main script to find the best hook function to inject your
+		own scripting focus on the "create-image" function starting with the first
+		"if fire-hook" line.
+
+		## CONTAMINATION
+		${name} tries to minimize impact to the host system, but specifically aims to
+		create identical images given the same config file (not necissarely bitwise
+		equal, but functionally equivelent), so it is careful to not copy things like
+		the current system locale into the new image. This is an aspirational goal at
+		this point and has not been confirmed. The reason ${name} tries to be careful
+		not to contaminate the new image is so the user has a fully defined starting
+		point for using hook functions to specifically customize as needed with no
+		surprises (ie. the resulting image will match the assumed starting point in
+		the ArchLinux documentation).
+
+		One exception to this philosophy of keeping the image "clean" is that this
+		script and the configuration file (if provided) will be saved to the
+		/etc/${name} directory on the newly created image.
+
+		## ROOT FILESYSTEM
+		Because the root filesystem in on ZFS, you can snapshot and clone the root
+		filesystem and reboot into any clone instantly (due to ZFS Copy On Write 
+		(COW) functionality). But perhaps more importantly, you can update images
+		using zfs send and receive funcionality.
+
+		Set the zpool "bootfs" property to select a dataset to mount on /root at
+		reboot, and then use the /etc/fstab file on that dataset to perform other
+		mounts (and then reboot).
+
+		In theory, but not yet extensively in practice, ZFS can store data encrypted,
+		so ZFS not only provides a strong solution to offsite back-ups, it may also
+		offer a strong solution to system update management (ie. poll for updates, then
+		receive to a clone, and reboot into the clone). If the update is
+		just changing some files ZFS will be able to distribute differential updates
+		extremely effeciently (if it is a whole new dataset the whole thing will have
+		to be transferred).
+
+		The purpose of this script is to provide a test-bed to determine whether the
+		practical benefits of ZFS as a root filesystem are justifiable and whether
+		the performance is adequate (especially around ram requirements).
+
+		## DEPENDENCIES
+		zfs must be installed on the server running this script along with the following
+		utilities and their dependencies. The version values below show version on
+		ArchLinux of each utility that this script was created/tested with, grouped by
+		the ArchLinux package containing them (but the script should work on any system
+		with these utilities).
+			core/bash=4.4.019-1
+			- bash (4.4.19)
+			core/pacman=5.0.2-2 (ArchLinux specific, but pkgs include in most linux distros)
+			- pacman (5.0.2-2)
+			- pacman-key (5.0.2-2)
+			- pacstrap (n/a)
+			core/coreutils=8.29-1
+			- truncate (n/a)
+			core/util-linux=2.31.1-1
+			- lsblk (2.31.1)
+			- blkid (2.31.1)
+			- losetup (2.31.1)
+			- mkswap (2.31.1)
+			extra/gptfdisk=1.0.3-1
+			- gdisk (1.0.3)
+			extra/parted=3.2-6
+			- partprobe (3.2)
+			core/dosfstools=4.1-1
+			- mkfs.vfat (4.1)
+			archzfs/zfs-utils-common=0.7.6-3
+			- zpool (n/a)
+			- zfs (n/a)
+			extra/qemu-headless=2.11.1-2 (or extra/qemu)
+			- qemu-img (2.11.1) (only needed to create vdi, qcow, or qcow2 images)
+
+		To setup these dependencies on an ArchLinux system first add the following to
+		/etc/pacman.d/mirrorlist (because the zfs package is not hosted by ArchLinux):
+		[archzfs]
+		Server = http://archzfs.com/\$repo/\$arch
+
+		Then run the following, noting that that this will install a complete
+		development environment to compile the zfs kernal modules, will take time and
+		install alot of additional dependencies (so do this in a virtual machine if
+		possible and then snapshot the result so you can revert to a clean starting
+		point if needed):
+			pacman -Syy
+			pacman -S --needed --noconfirm \\
+				bash pacman coreutils util-linux gptfdisk parted \\
+				dosfstools zfs-dkms zfs-utils-common
+
+		On non-ArchLinux systems just find and install the package containing each of
+		these dependencies (many distros include a packages with the pacman scripts).
+
+		## TODO
+		The following functionality is planned, but not incorporated yet. Please
+		raise an issue at https://github.com/varasys/${name} if you are interested
+		in contributing to further development:
+			- dm-veritas image validation (still considering whether this is
+			applicable/worthwhile, doesn't look too hard on the surface)
+			- BIOS boot loading support (it should just be a couple lines of script, but
+			I don't know what they are and don't need BIOS support myself, but happy to
+			implement if someone explains what is required or submits a patch)
+			- system hi-jack support (to install on VPS that can't upload images by
+			unmounting current root and overwriting boot device with image from this
+			script)
+			- root filesystem encryption support (in theory encrypted root is supported,
+			but complicates boot loading and probably has no strong use case with
+			respect to the root filesystem)
+			(note that all other non-root datasets can already be encrypted)
+			- allow virtual machines to boot from the same rootfs as the running system
+			(or any of it's snapshots) (the issue is that VMs usually want images,
+			unlike containers which are happy with directories, so how to allow the
+			system to present itself to a VM as an image (may not be possible) maybe
+			something device mapper could help with?)
+			- Create ArchLinux User Repository (AUR) for this script (eventually to become
+			a pkg if found useful (should be simple I think))
+
+		Thanks for your time, and we hope you have a pleasant experience ;-)
+		EOF
+}
+
+function create-image() {
+	[[ $( id -u ) -eq 0 ]] || die "must run as root"
+	# TODO find out why the following traps need to be defined within this function (why don't the global traps work?)
+	trap 'declare -gx err=$?; error-trap "error (${BASH_FUNCTION:-${0}} line ${LINENO})";' ERR
+	trap 'declare -gx err=1; error-trap "operation interrupted by user";' INT
+
+	function fire-hook() {
+		handled=false
+		set-debug
+		export hook="${1}"
+		if declare -f "${1}" &> "/dev/null"; then
+			say "${bold}${yellow}" "processing \"${1}\" (custom)"
+			${1} || die "processing \"${1}\" (custom)"
+		fi
+		[[ "${handled}" = true ]] && warn "${1} handled by custom script" "(skipping built-in script)" || say "${bold}${cyan}" "processing \"${1}\""
+		[[ "${handled}" != true ]]
+	}
+
+	if fire-hook "prepare-cache"; then
+		local -r pattern='^[^:]+:[^:]+$'
+		if [[ ${CACHE_PATH:-} =~ ${pattern} ]]; then
+			if ! { mount | grep -q "^${CACHE_PATH} on /var/cache/pacman/pkg "; }; then
+				add-tear-down "umount /var/cache/pacman/pkg"
+				inform "sshfs mounting ${CACHE_PATH} on /var/cache/pacman/pkg" >&2
+				sshfs "${CACHE_PATH}" "/var/cache/pacman/pkg"
+			fi
+			declare -rgx CACHE_PATH="/var/cache/pacman/pkg"
+		fi
+	fi
+
+	declare -rax reqd_pkgs=( extra/arch-install-scripts core/util-linux extra/gptfdisk extra/parted core/dosfstools extra/qemu-headless )
+	if fire-hook "init-system"; then
+		if [[ "${init_system:-}" = true ]]; then
+			pacman-key --init >&${verbose_fd}
+			pacman-key --populate >&${verbose_fd}
+			pacman-key --recv-key "${ARCH_ZFS_KEY}" >&${verbose_fd}
+			pacman-key --lsign-key "${ARCH_ZFS_KEY}" >&${verbose_fd}
+			pacman -Syy
+			echo "" | pacman -S --needed --noconfirm ${reqd_pkgs[@]}
+		fi
+		which zpool &> "/dev/null" || die "zfs not installed (manually install it)"
+	fi
+
+	if fire-hook "prepare-env"; then
+		[[ "$( source /usr/lib/os-release; echo "${ID}"; )" = "arch" ]] || warn "current os does not appear to be archlinux (so some required tools may be missing)"
+		declare -a missing_pkgs=( )
+		for pkg in ${reqd_pkgs[@]}; do
+			if ! pacman -Q ${pkg##*/} &> "/dev/null"; then
+				warn "missing ${pkg} package"
+				missing_pkgs+=${pkg}
+			fi
+		done
+		unset pkg
+		if (( ${#missing_pkgs[@]} > 0 )); then
+			die "missing required packages - run again with \"-s\" option to try and install them"
+		fi
+		zpool list "${POOL_NAME}" &> "/dev/null" && die "pool ${POOL_NAME} already exists"
+		[[ -b "$( losetup -f )" ]] || die "no free loop devices available (they must be bind mounted if running inside a container)"
+		mount | grep -q "^${CHROOT_PATH}" && die "existing mounts on ${CHROOT_PATH}"
+		[[ -n "$( ls -A ${CHROOT_PATH} )" ]] && die "${CHROOT_PATH} is not empty"
+		[[ -n "${IMAGE_FILE}" && -e "${IMAGE_FILE}" ]] && die "${IMAGE_FILE} already exists"
+		[[ -n "${VDI_FILE}" && -e "${VDI_FILE}" ]] && die "${VDI_FILE} already exists"
+		[[ -n "${QCOW_FILE}" && -e "${QCOW_FILE}" ]] && die "${QCOW_FILE} already exists"
+		[[ -n "${QCOW2_FILE}" && -e "${QCOW2_FILE}" ]] && die "${QCOW2_FILE} already exists"
+	fi
+	
+	declare -rx device=${BLOCK_DEV:-${IMAGE_FILE}}
+	if fire-hook "prepare-loop-dev"; then
+		if [[ -b "${device}" ]]; then
+			[[ -z "$( blkid -c /dev/null ${device} )" ]] || die "${device} does not appear to be empty ([carefully] use \"wipefs -a ${device}\" to wipe it)"
+		else
+			[[ -e "${device}" ]] && die "file ${device} already exists"
+			truncate -s "${IMAGE_SIZE}" "${device}"
+		fi
+		declare -r loop_dev="$( losetup --find --show "${device}" )"
+		[[ -b "${loop_dev}" ]] && add-tear-down "losetup -d ${loop_dev}" || die "failed to create loop device"
+	fi
+
+	if fire-hook "prepare-partitions"; then
+		echo "o Y n 1  +550M ef00 n 2  +${SWAP_SIZE} 8200 n 3   8304 w Y " | tr " " "\n" | gdisk "${loop_dev}" >&${verbose_fd}
+		gdisk "${loop_dev}" -l >&${verbose_fd}
+		partprobe "${loop_dev}"
+		declare -rx efi_loop_dev="${loop_dev}p1" && [[ -b "${efi_loop_dev}" ]] || die "failed to create efi loop device"
+		declare -rx swap_loop_dev="${loop_dev}p2" && [[ -b "${swap_loop_dev}" ]] || die "failed to create swap loop device"
+		declare -rx zfs_loop_dev="${loop_dev}p3" && [[ -b "${zfs_loop_dev}" ]] || die "failed to create zfs loop device"
+	fi
+
+	declare -rx ZPOOL_VDEV_NAME_PATH=1 # if this is 1 the zfs command will output full device paths (instead of just device names)
+	if fire-hook "prepare-zfs-pool"; then
+		zpool create -R "${CHROOT_PATH}" -O "relatime=on" -O "compression=lz4" -O "acltype=posixacl" \
+			-O "xattr=sa" -o "ashift=12" -O "mountpoint=legacy" "${POOL_NAME}" "${zfs_loop_dev}"
+		add-tear-down "zpool export ${POOL_NAME}"
+		declare -rx zfs_id=$( zpool get -H -o "value" "guid" "${POOL_NAME}" )
+		zpool export "${POOL_NAME}"
+		while ! zpool import -R "${CHROOT_PATH}" -d "/dev/disk/by-uuid" "${zfs_id}" &> "/dev/null"; do
+			inform "waiting for pool ${zfs_id} on ${zfs_loop_dev}"
+			partprobe "${zfs_loop_dev}" &> "/dev/null" || : # ignore error (just probing to get link to show up in /dev/disk/by-uuid)
+			sleep 1
+		done
+	fi
+
+	if fire-hook "prepare-directories"; then
+		add-tear-down "umount -R ${CHROOT_PATH}"
+		
+		zfs create -o "canmount=noauto" "${POOL_NAME}/system"
+		zfs create -o "mountpoint=/" "${POOL_NAME}/system/default"
+		zfs create "${POOL_NAME}/data"
+		mkdir -p "${CHROOT_PATH}/root"
+		zfs create "${POOL_NAME}/data/root"; mount -t zfs "${POOL_NAME}/data/root" "${CHROOT_PATH}/root"
+		chmod 750 "${CHROOT_PATH}/root"
+		mkdir -p "${CHROOT_PATH}/home"
+		zfs create "${POOL_NAME}/data/home"; mount -t zfs "${POOL_NAME}/data/home" "${CHROOT_PATH}/home"
+		mkdir -p "${CHROOT_PATH}/srv"
+		zfs create "${POOL_NAME}/data/srv"; mount -t zfs "${POOL_NAME}/data/srv" "${CHROOT_PATH}/srv"
+		mkdir -p "${CHROOT_PATH}/var/lib/machines"
+		zfs create -o "recordsize=8K" -o "primarycache=metadata" -o "logbias=throughput" "${POOL_NAME}/data/machines"
+			mount -t zfs "${POOL_NAME}/data/machines" "${CHROOT_PATH}/var/lib/machines"
+		mkdir -p "${CHROOT_PATH}/var/lib/postgres"
+		zfs create -o "recordsize=8K" -o "primarycache=metadata" -o "logbias=throughput" "${POOL_NAME}/data/postgres"
+			mount -t zfs "${POOL_NAME}/data/postgres" "${CHROOT_PATH}/var/lib/postgres"
+		
+		zpool set bootfs="${POOL_NAME}/system/default" "${POOL_NAME}"
+
+		mkdir -p \
+			"${CHROOT_PATH}/boot" \
+			"${CHROOT_PATH}/etc/${name}" \
+			"${CHROOT_PATH}/root/.ssh" \
+			"${CHROOT_PATH}/tmp"
+		mount -t "tmpfs" "tmpfs" "${CHROOT_PATH}/tmp" && add-tear-down "umount ${CHROOT_PATH}/tmp"
+	fi
+
+	declare -f _generate-pacman-config &> "/dev/null" || function _generate-pacman-config() {
+		cat <<-EOF
+			[options]
+			Architecture = auto
+			SigLevel    = Required DatabaseOptional
+			LocalFileSigLevel = Optional TrustedOnly
+			RootDir     = ${1:-/}
+			DBPath      = ${1:-}/var/lib/pacman
+			CacheDir    = ${2:-/var/cache/pacman/pkg}
+			GPGDir      = ${1:-}/etc/pacman.d/gnupg
+			LogFile     = ${1:-}/var/log/pacman.log
+
+			[core]
+			Server = http://mirrors.evowise.com/archlinux/\$repo/os/\$arch
+			Server = http://mirror.rackspace.com/archlinux/\$repo/os/\$arch
+			$( [[ -d "${1:-}/etc/pacman.d/mirrorlist" ]] && echo "Include = ${1:-}/etc/pacman.d/mirrorlist" )
+			[extra]
+			Server = http://mirrors.evowise.com/archlinux/\$repo/os/\$arch
+			Server = http://mirror.rackspace.com/archlinux/\$repo/os/\$arch
+			$( [[ -d "${1:-}/etc/pacman.d/mirrorlist" ]] && echo "Include = ${1:-}/etc/pacman.d/mirrorlist" )
+			[community]
+			Server = http://mirrors.evowise.com/archlinux/\$repo/os/\$arch
+			Server = http://mirror.rackspace.com/archlinux/\$repo/os/\$arch
+			$( [[ -d "${1:-}/etc/pacman.d/mirrorlist" ]] && echo "Include = ${1:-}/etc/pacman.d/mirrorlist" )
+			[archzfs]
+			Server = http://archzfs.com/\$repo/\$arch
+			EOF
+	}
+
+	if fire-hook "prepare-pacman"; then
+		mkdir -p "${CHROOT_PATH}/var/log" "${CHROOT_PATH}/var/lib/pacman/sync"
+		_generate-pacman-config "${CHROOT_PATH}" "${CACHE_PATH}" > "${CHROOT_PATH}/etc/${name}/pacman.conf"
+		function _pacman() {
+			pacman${pacman_debug:- }--config "${CHROOT_PATH}/etc/${name}/pacman.conf" "${@}";
+		}
+		function _pacman-key() {
+			pacman-key --config "${CHROOT_PATH}/etc/${name}/pacman.conf" "${@}";
+		}
+		function _pacstrap() {
+			pacstrap -C "${CHROOT_PATH}/etc/${name}/pacman.conf" "${@}";
+		}
+	fi
+	declare -fx _pacman _pacman-key _pacstrap
+
+	if fire-hook "prepare-pacman-keys"; then
+		_pacman-key --init
+		_pacman-key --populate
+		for key_id in "${TRUSTED_KEYS[@]}"; do
+			_pacman-key --recv-key "${key_id}"
+			_pacman-key --lsign-key "${key_id}"
+		done
+	fi
+
+	if fire-hook "install-miniroot"; then
+		( for pkg in "${BASE_EXCLUDE_PKGS[@]}"; do echo "n"; done; yes "" || : ) \
+			| _pacstrap -c -G -i -M "${CHROOT_PATH}" base${BASE_EXCLUDE_PKGS:+ --ignore $( IFS=,; echo "${BASE_EXCLUDE_PKGS[*]}" )}
+		cp --backup --suffix ".orig" <( _generate-pacman-config "/" "/var/cache/pacman/pkg" ) "${CHROOT_PATH}/etc/pacman.conf"
+		arch-chroot "${CHROOT_PATH}" systemd-firstboot --timezone="UTC" 2>&${verbose_fd}
+		cp -r "${CHROOT_PATH}/etc/skel/." "${CHROOT_PATH}/root/"
+		mkdir -p "${CHROOT_PATH}/etc/${name}"
+		[[ -n "${config_file:-}" ]] && cp "${config_file}" "${CHROOT_PATH}/etc/${name}/${name}.conf.orig"
+		print-config > "${CHROOT_PATH}/etc/${name}/${name}.conf"
+		cp "${0}" "${CHROOT_PATH}/usr/sbin/${0##*/}"
+		chmod 744 "${CHROOT_PATH}/usr/sbin/${0##*/}"
+		arch-chroot "${CHROOT_PATH}" systemctl enable "systemd-resolved.service" >&${verbose_fd}
+		arch-chroot "${CHROOT_PATH}" systemctl enable "systemd-networkd.service" >&${verbose_fd}
+		cat > "${CHROOT_PATH}/etc/systemd/network/20-dhcp.network" <<-EOF
+			[Match]
+			Name=enp*
+
+			[Network]
+			DHCP=v4
+			EOF
+		arch-chroot "${CHROOT_PATH}" sh -c "cat '/proc/mounts' | awk '\$1 ~ \"^${POOL_NAME}/\" && \$2 != \"/\" { print }' >> '/etc/fstab'"
+	fi
+
+	if fire-hook "set-locale"; then
+		if [[ ! -e "${CHROOT_PATH}/etc/locale.conf" ]]; then
+			[[ -e "${CHROOT_PATH}/etc/locale.gen" ]] && mv "${CHROOT_PATH}/etc/locale.gen" "${CHROOT_PATH}/etc/locale.gen.orig"
+			IFS=\n printf "%s\n" "${LOCALES[@]}" > "${CHROOT_PATH}/etc/locale.gen"
+			arch-chroot "${CHROOT_PATH}" locale-gen >&${verbose_fd}
+			arch-chroot "${CHROOT_PATH}" systemd-firstboot --locale="${LOCALES[0]% *}" >&${verbose_fd}
+		fi
+	fi
+
+	if fire-hook "copy-ssh-keys"; then
+		if [[ -d "${CHROOT_PATH}/root/.ssh" ]]; then
+			find "${CHROOT_PATH}/root/.ssh" -type "d" -execdir chmod "700" {} +
+			find "${CHROOT_PATH}/root/.ssh" -type "f" -execdir chmod "600" {} +
+			find "${CHROOT_PATH}/root/.ssh" -type "f" -iname "*.pub" -execdir chmod "644" {} +
+		fi
+	fi
+
+	if fire-hook "prepare-users"; then
+		:
+	fi
+
+	if fire-hook "populate-mirrorlist"; then
+		warn "define \"populate-mirrorlist\" hook to populate the mirror list and set \"handled=true\" to skip this warning"
+	fi
+
+	if fire-hook "snapshot-miniroot"; then
+		zfs snapshot -r "${POOL_NAME}@${hook##*-}"
+		zfs hold -r "io.varasys.${name}" "${POOL_NAME}@${hook##*-}"
+	fi
+
+	if fire-hook "prepare-efi-volume"; then
+		mkfs.vfat -F32 "${efi_loop_dev}" >&${verbose_fd}
+		add-tear-down "umount ${CHROOT_PATH}/boot"
+		mount -t vfat "${efi_loop_dev}" "${CHROOT_PATH}/boot"
+		echo "UUID=$( blkid -c /dev/null -o value -s UUID ${efi_loop_dev} ) /boot vfat ro,relatime,fmask=0022,dmask=0022,codepage=437,iocharset=iso8859-1,shortname=mixed,utf8,errors=remount-ro 0 2" >> "${CHROOT_PATH}/etc/fstab"
+	fi
+
+	if fire-hook "prepare-swap"; then
+		mkswap "${swap_loop_dev}" >&${verbose_fd}
+		echo "UUID=$( blkid -c /dev/null -o value -s UUID ${swap_loop_dev} ) swap swap defaults 0 0" >> "${CHROOT_PATH}/etc/fstab"
+	fi
+
+	if fire-hook "install-bootable"; then
+		if (( ${#BOOTABLE_PKGS[@]} > 0 )); then
+			( # jump through hoops in a sub-shell to avoid contaminating the environment
+				kernel_dep=$( ( _pacman -Sp --needed --root "${CHROOT_PATH}" ${BOOTABLE_PKGS[@]} 2>&${verbose_fd} || : ) | awk '$4 ~ /^linux-hardened=/ { print $4; exit; }' )
+				if [[ -n "${kernel_dep}" ]]; then
+					kernel_pkg="${kernel_dep/=/-}-$( uname -m ).pkg.tar.xz"
+					warn "zfs-linux-hardened depends on ${kernel_dep} (which is not the latest) [jumping through hoops to try and make this happen...]"
+					if [[ -f "${CACHE_PATH}/${kernel_pkg}" ]]; then
+						warn "installing from local cache: ${CACHE_PATH}/${kernel_pkg}"
+						echo "" | _pacman -U --needed --noconfirm "/var/cache/pacman/pkg/${kernel_pkg}"
+					else
+						echo "installing from online archive: https://archive.archlinux.org/packages/l/linux-hardened/${kernel_pkg}"
+						echo "" | _pacman -U --needed --noconfirm "https://archive.archlinux.org/packages/l/linux-hardened/${kernel_pkg}"
+					fi
+				fi
+			)
+			echo "" | _pacman -S --needed --noconfirm --root "${CHROOT_PATH}" "${BOOTABLE_PKGS[@]}"
+			arch-chroot "${CHROOT_PATH}" systemctl enable "sshd.socket" >&${verbose_fd}
+			arch-chroot "${CHROOT_PATH}" systemctl enable "rngd.service" >&${verbose_fd}
+			arch-chroot "${CHROOT_PATH}" systemctl enable "ntpd.service" >&${verbose_fd}
+		fi
+	fi
+
+	if fire-hook "prepare-initramfs"; then
+		echo "HOOKS=( base udev autodetect modconf block keyboard zfs filesystems )" >> "${CHROOT_PATH}/etc/mkinitcpio.conf"
+		arch-chroot "${CHROOT_PATH}" mkinitcpio -P >&${verbose_fd}
+	fi
+
+	if fire-hook "install-grub"; then
+		arch-chroot "${CHROOT_PATH}" grub-install --target=$( uname -m )-efi --efi-directory=/boot --removable --bootloader-id=arch >&${verbose_fd}
+		## by default grup includes the quiet argument in the default linux argument list
+		## this removes the "quiet boot option to show logs while booting"
+		sed -i '/^GRUB_CMDLINE_LINUX_DEFAULT=/ { s,quiet,, }' "${CHROOT_PATH}/etc/default/grub"
+		arch-chroot "${CHROOT_PATH}" grub-mkconfig -o "/boot/grub/grub.cfg" >&${verbose_fd}
+		## by default grub2 uses root=ZFS=dataset method to select root (see mkinitcpio -H zfs)
+		## this changes the final config to use zfs=auto method (which will query the pool for the bootfs property)
+		sed -i 's|root=ZFS=[^ ]*|zfs=auto|' "${CHROOT_PATH}/boot/grub/grub.cfg"
+	fi
+
+	if fire-hook "snapshot-bootable"; then
+		zfs snapshot -r "${POOL_NAME}@${hook##*-}"
+		zfs clone "${POOL_NAME}/system/default@${hook##*-}" "${POOL_NAME}/system/restore"
+		zfs set readonly="on" "${POOL_NAME}/system/restore"
+		zfs hold -r "io.varasys.${name}" "${POOL_NAME}@${hook##*-}"
+	fi
+
+	if fire-hook "install-workstation"; then
+		(( ${#WORKSTATION_PKGS[@]} > 0 )) \
+			&& echo "" | _pacman -S --needed --noconfirm "${WORKSTATION_PKGS[@]}"
+	fi
+
+	if fire-hook "snapshot-workstation"; then
+		zfs snapshot -r "${POOL_NAME}@${hook##*-}"
+		zfs hold -r "io.varasys.${name}" "${POOL_NAME}@${hook##*-}"
+	fi
+
+	if fire-hook "clean-up"; then
+		tear-down
+	fi
+
+	if fire-hook "finalize-image"; then
+		congrats "Finished creating ${name} image on ${device}"
+	fi
+
+	if fire-hook "save-image-file"; then
+		if [[ ! "${device}" -ef "${IMAGE_FILE:-}" && -n "${IMAGE_FILE:-}" ]]; then
+			qemu-img convert -p -f raw -O raw "${device}" "${IMAGE_FILE}"
+		fi
+	fi
+	
+	if fire-hook "save-vdi-file"; then
+		if [[ -n "${VDI_FILE}" ]]; then
+			qemu-img convert -p -f raw -O vdi "${device}" "${VDI_FILE}"
+		fi
+	fi
+	
+	if fire-hook "save-qcow-file"; then
+		if [[ -n "${QCOW_FILE}" ]]; then
+			qemu-img convert -c -p -f raw -O qcow "${device}" "${QCOW_FILE}"
+		fi
+	fi
+	
+	if fire-hook "save-qcow2-file"; then
+		if [[ -n "${QCOW2_FILE}" ]]; then
+			qemu-img convert -c -p -f raw -O qcow2 "${device}" "${QCOW2_FILE}"
+		fi
+	fi
+}
+
+
+## the first time this is called (with configured unset) it will initialize all variables
+## subsequent calls will print the current configuration to stdout
+function initialize() {
+	[[ -n "${config_file:-}" ]] && source "${config_file}"
+
+	## set default values here (check create-config function to see when/how each default is used)
+	local -rA defaults=(
+		[SUFFIX]="\$( date +%s )"
+		[BLOCK_DEV]=""
+		[IMAGE_FILE]="./${name}-\${SUFFIX}.img"
+		[VDI_FILE]=""
+		[QCOW_FILE]=""
+		[QCOW2_FILE]=""
+		[IMAGE_SIZE]="20G"
+		[SWAP_SIZE]="4G"
+		[CHROOT_PATH]="/mnt"
+		[CACHE_PATH]="/var/cache/pacman/pkg"
+		[POOL_NAME]="zroot"
+	)
+	local -ra default_trusted_keys=( 5E1ABF240EE7A126 ) # this is the archzfs key
+	local -ra default_locales=( 'en_US.UTF-8 UTF-8' )
+	local -ra default_base_exclude_pkgs=( linux )
+	local -ra default_bootable_pkgs=( zfs-linux-hardened grub-efi-$( uname -m ) efibootmgr rng-tools openssh ntp )
+	local -ra default_workstation_pkgs=( rsync vim htop iftop tmux pv sshfs gdisk qemu-headless pkgfile arch-install-scripts dosfstools parted ovmf )
+	declare -gxA config_vars=( ) # associative array to store strings to print in config file (unevaluated)
+	local var_name=
+	var_name=CONFIG_VERSION
+		config_vars[${var_name}]=$( printf "%s='%s'" "${var_name}" "${!var_name:-${version}}" )
+		eval declare -rgx "${var_name}=$( eval ${config_vars[${var_name}]}; echo "${!var_name}" )"
+	var_name=SUFFIX
+		config_vars[${var_name}]=$( printf "%s='%s'" "${var_name}" "${!var_name:-${defaults[${var_name}]}}" )
+		eval declare -rgx "${var_name}=$( eval ${config_vars[${var_name}]}; echo "${!var_name}" )"
+	var_name=BLOCK_DEV
+		config_vars[${var_name}]=$( printf "%s='%s'" "${var_name}" "${!var_name:-${defaults[${var_name}]}}" )
+		eval declare -rgx "${var_name}=$( eval ${config_vars[${var_name}]}; echo "${!var_name}" )"
+	var_name=IMAGE_FILE
+		[[ -z "${BLOCK_DEV}" ]] && local default="${defaults[${var_name}]}" || local default=""
+		config_vars[${var_name}]=$( printf "%s='%s'" "${var_name}" "${!var_name:-${default}}" )
+		eval declare -rgx "${var_name}=$( eval ${config_vars[${var_name}]}; echo "${!var_name}" )"
+		unset default
+	var_name=VDI_FILE
+		config_vars[${var_name}]=$( printf "%s='%s'" "${var_name}" "${!var_name:-${defaults[${var_name}]}}" )
+		eval declare -rgx "${var_name}=$( eval ${config_vars[${var_name}]}; echo "${!var_name}" )"
+	var_name=QCOW_FILE
+		config_vars[${var_name}]=$( printf "%s='%s'" "${var_name}" "${!var_name:-${defaults[${var_name}]}}" )
+		eval declare -rgx "${var_name}=$( eval ${config_vars[${var_name}]}; echo "${!var_name}" )"
+	var_name=QCOW2_FILE
+		config_vars[${var_name}]=$( printf "%s='%s'" "${var_name}" "${!var_name:-${defaults[${var_name}]}}" )
+		eval declare -rgx "${var_name}=$( eval ${config_vars[${var_name}]}; echo "${!var_name}" )"
+	var_name=IMAGE_SIZE
+		[[ -n "${BLOCK_DEV}" ]] && local default=$( lsblk -bdno size ${BLOCK_DEV} 2> /dev/null ) || local default="${defaults[${var_name}]}"
+		config_vars[${var_name}]=$( printf "%s='%s'" "${var_name}" "${!var_name:-${default}}" )
+		eval declare -rgx "${var_name}=$( eval ${config_vars[${var_name}]}; echo "${!var_name}" )"
+		unset default
+	var_name=SWAP_SIZE
+		config_vars[${var_name}]=$( printf "%s='%s'" "${var_name}" "${!var_name:-${defaults[${var_name}]}}" )
+		eval declare -rgx "${var_name}=$( eval ${config_vars[${var_name}]}; echo "${!var_name}" )"
+	var_name=CHROOT_PATH
+		config_vars[${var_name}]=$( printf "%s='%s'" "${var_name}" "${!var_name:-${defaults[${var_name}]}}" )
+		eval declare -rgx "${var_name}=$( eval ${config_vars[${var_name}]}; echo "${!var_name}" )"
+	var_name=CACHE_PATH #don't set read-only since it may change later if sshfs cache is used
+		config_vars[${var_name}]=$( printf "%s='%s'" "${var_name}" "${!var_name:-${defaults[${var_name}]}}" )
+		eval declare -gx "${var_name}=$( eval ${config_vars[${var_name}]}; echo "${!var_name}" )"
+	var_name=POOL_NAME
+		config_vars[${var_name}]=$( printf "%s='%s'" "${var_name}" "${!var_name:-${defaults[${var_name}]}}" )
+		eval declare -rgx "${var_name}=$( eval ${config_vars[${var_name}]}; echo "${!var_name}" )"
+	var_name=TRUSTED_KEYS
+		config_vars[${var_name}]=$( printf "%s=( %s)" "${var_name}" "$( printf "'%s' " "${TRUSTED_KEYS[@]:-"${default_trusted_keys[@]}"}" )" )
+		eval declare -ragx ${config_vars[${var_name}]}
+	var_name=LOCALES
+		config_vars[${var_name}]=$( printf "%s=( %s)" "${var_name}" "$( printf "'%s' " "${LOCALES[@]:-"${default_locales[@]}"}" )" )
+		eval declare -ragx ${config_vars[${var_name}]}
+	var_name=BASE_EXCLUDE_PKGS
+		config_vars[${var_name}]=$( printf "%s=( %s)" "${var_name}" "$( printf "'%s' " "${BASE_EXCLUDE_PKGS[@]:-"${default_base_exclude_pkgs[@]}"}" )" )
+		eval declare -ragx ${config_vars[${var_name}]}
+	var_name=BOOTABLE_PKGS
+		config_vars[${var_name}]=$( printf "%s=( %s)" "${var_name}" "$( printf "'%s' " "${BOOTABLE_PKGS[@]:-"${default_bootable_pkgs[@]}"}" )" )
+		eval declare -ragx ${config_vars[${var_name}]}
+	var_name=WORKSTATION_PKGS
+		config_vars[${var_name}]=$( printf "%s=( %s)" "${var_name}" "$( printf "'%s' " "${WORKSTATION_PKGS[@]:-"${default_workstation_pkgs[@]}"}" )" )
+		eval declare -ragx ${config_vars[${var_name}]}
+	declare -r config_vars
+}
+
+function print-config() {
+	## this function generates stub hook functions (or regurgitates hook functions already defined)
+	## it is called in the heredoc below in a while loop that scans this file looking for hook functions
+	## by searching for "if fire-hook " (and these if statements must be preceeded by only whitespace to be found)
+	function gen-default-function() {
+		if declare -fp "${1:?usage: ${FUNCNAME} <function_name>}" &> "/dev/null"; then
+			declare -fp "${1}" | grep -v "^declare"
+		else
+			case "${1}" in
+				copy-ssh-keys) cat <<-EOF
+					## uncomment the following to copy ssh keys to the image (adapt as needed)
+					# ${1} () {
+					#     cp -r /root/.ssh/authorized_keys* \${CHROOT_PATH}/root/.ssh/
+					# }
+					EOF
+					;;
+				snapshot-miniroot) cat <<-EOF
+					## uncomment the following to change the default keyboard layout (adapt as needed)
+					# ${1} () {
+					#     arch-chroot "${CHROOT_PATH}" systemd-firstboot --keymap=dvorak
+					# }
+					EOF
+					;;
+				*) printf "# %s () { set-debug debug; }\n" "${1}";;
+			esac
+		fi
+	}
+	# note that that EOF in the following heredoc does NOT have single quotes (so variables will be expanded unless escaped with a backslash)
+	cat <<-EOF
+		## ${name} config file (see https://github.com/varasys/${name} for more info)
+		
+		## This file is bash script which is sourced by ${name} when run with the "-c" option
+		## to define environment variables and custom hook functions.
+
+		## This file may be automatically generated with default values (or, optionally, based on
+		## an existing configuration) with:
+		## ${name} [-c config_in] -C > config_out  
+
+		## The following defines which version of ${name} this config was created with;
+		## a warning will be printed at runtime if this does not match ${name} version
+		## as a hint in case an old config is not compatable with updated ${name}
+		## this variable is preserved when regenerating a config (as a hint where the original
+		## config came from)
+		${config_vars[CONFIG_VERSION]}
+
+		## Variables with single quotes will be evaluated during execution (but left unchanged in "-C" output)
+		## use \${SUFFIX} in filenames (include single quotes or it will be evaluated early by the shell)
+		${config_vars[SUFFIX]}
+
+		## target(s)
+		${config_vars[BLOCK_DEV]}
+		${config_vars[IMAGE_FILE]}
+		${config_vars[VDI_FILE]}
+		${config_vars[QCOW_FILE]}
+		${config_vars[QCOW2_FILE]}
+		
+		## image properties
+		${config_vars[IMAGE_SIZE]}
+		${config_vars[SWAP_SIZE]}
+		
+		## misc. filesystem info
+		${config_vars[CHROOT_PATH]}
+		${config_vars[CACHE_PATH]}
+		${config_vars[POOL_NAME]}
+
+		## list of trusted keys (in addition to "pacman-key --populate" keys)
+		${config_vars[TRUSTED_KEYS]}
+
+		## locales (put default locale first)
+		${config_vars[LOCALES]}
+		
+		## package lists (snapshot will be created after installing each list)
+		## use "zfs list -t snap" when running the image to see all snapshots
+		${config_vars[BASE_EXCLUDE_PKGS]}
+		${config_vars[BOOTABLE_PKGS]}
+		${config_vars[WORKSTATION_PKGS]}
+
+		## uncomment and complete the following functions to pre-inject additional scripting
+		## set "handled=true" to override the built-in scripting completely
+		## use "{ set-debug debug; }" to turn on verbose debugging and bash shell for individual sections
+		## all hooks must return exit status 0 to continue (use ":" on the last line to
+		## guarantee a successful return status (if appropriate); especially when doing things like
+		## '[[ -f "file" ]] && rm "file"' since this would otherwise exit with non-zero
+		## status if it is the last line of the function and "file" does not exist.
+		
+		$(
+			for func in $( grep -o '^\s*if fire-hook \S*[; ]' "${0}" | awk '{ gsub(/"|;/, "", $3); ;  print $3 }' ); do
+				gen-default-function ${func}
+			done
+		)
+		EOF
+}
+
+## HERE IS WHERE THE ACTION BEGINS!!!! - everything above is just setting things up
+while getopts "e:hCsc:d:vV" flag; do
+	case "${flag}" in
+		h ) print-help; exit 0;;
+		c ) declare -rx config_file="${OPTARG}"; [[ "${0}" -ef "${OPTARG}" ]] && die "${OPTARG} is not a config file";; # (error check the mistake I keep making)
+		C ) declare -rx config_only=true;; # can't do it now because need to wait and see if config file is also provided
+		d ) declare -x default_debug="${OPTARG}";;
+		s ) declare -x init_system=true;; # this is not well implemented, and dependencies are discussed in the help, so probably delete this altogether
+		e ) declare -x err_cmd="${OPTARG}";;
+		v ) declare -x err_cmd="bash"; default_debug="verbose";;
+		V ) echo "${version}"; exit 0;;
+		\? ) die "Invalid option: -${OPTARG:-}";;
+	esac
+done
+shift $(( OPTIND-1 ))
+declare -x default_debug=${default_debug:-none}
+set-debug
+initialize
+[[ "${CONFIG_VERSION}" != "${version}" ]] && warn "using config ${CONFIG_VERSION} with ${name} ${version} (not necissarely a problem)" >&2
+if [[ "${config_only:-}" = true ]]; then
+	print-config
+else
+	create-image
+fi
