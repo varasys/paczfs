@@ -89,88 +89,53 @@ This means that there are two ways to look at the script when you open it up:
   Even better if you can bring some technical knowledge (such as getting BIOS booting working; which we don't use, so it's not our priority, but if someone will tell us which three lines to add we will find where to add them).
 
 ## CONFIGURATION
-If a configuration file is provided it is sourced before script execution. This
-has the same effect as literally cutting and pasting the config file into
-the script. The point is that: 1) the config file uses bash syntax, and 2) the
-config file is sourced (or included into this script) during execution.
+If a configuration file is provided it is sourced before script execution. This has the same effect as literally cutting and pasting the config file into the script. The point is that: 1) the config file uses bash syntax, and 2) the config file is sourced (or included into this script) during execution.
 
-The config file is used to set environment variables and define "hook
-functions", which are user defined functions which are run at pre-determined times
-throughout the image creation (see below).
+The config file is used to set environment variables and define "hook functions", which are user defined functions which are run at pre-determined times throughout the image creation (see below).
 
-The command line options to paczfs only control debug and configuration settings.
-Environment variables are used to configure the final image. The environment
-variables may be set on the command line prior to executing `paczfs`, or can be set
-in the config file (initially created with `paczfs -C > out_file`). The priority
-of variables is the config file first, command line second, and defaults third.
+The command line options to paczfs only control debug and configuration settings. Environment variables are used to configure the final image. The environment variables may be set on the command line prior to executing `paczfs`, or can be set in the config file (initially created with `paczfs -C > out_file`). The priority of variables is the config file first, command line second, and defaults third.
 
-In addition to defining environment variables, hook functions may be defined in
-the configuration file. "Hook functions" are functions which the script will execute at pre-determined stages during the image generation if they are defined in the config file. The default
-configuration template has some examples (commented out) of hook functions
-to copy ssh keys and set the default keyboard layout.
+In addition to defining environment variables, hook functions may be defined in the configuration file. "Hook functions" are functions which the script will execute at pre-determined stages during the image generation if they are defined in the config file. The default configuration template has some examples (commented out) of hook functions to copy ssh keys and set the default keyboard layout.
 
-Run `paczfs -C` to see a configuration file template listing the applicable
-environment variables and hook functions. Uncomment and adjust the variables
-and hook functions as needed.
+Run `paczfs -C` to see a configuration file template listing the applicable environment variables and hook functions. Uncomment and adjust the variables and hook functions as needed.
 
-Note that paczfs will "evaluate" each variable (using eval), so it is okay to
-"embed" other variables in single quotes (ie. VDI_FILE='${SUFFIX}.vdi'). The
-single quotes will prevent the shell from expanding the variable (but paczfs
-will still expand it when needed, which is typically after the referenced
-variable has been set).
+Note that paczfs will "evaluate" each variable (using eval), so it is okay to "embed" other variables in single quotes (ie. VDI_FILE='${SUFFIX}.vdi'). The single quotes will prevent the shell from expanding the variable (but paczfs will still expand it when needed, which is typically after the referenced variable has been set).
 
-To see when each hook function will be executed scan the script for lines that
-say 'if fire-hook ' which will fire the hook listed in the if statement. You
-can prevent the pre-defined code from executing by setting "handled=true" in
-the hook function (in which case you are responsible for ensuring that
-everything that is required in that section is performed in your hook function).
+To see when each hook function will be executed scan the script for lines that say 'if fire-hook ' which will fire the hook listed in the if statement. You can prevent the pre-defined code from executing by setting "handled=true" in the hook function (in which case you are responsible for ensuring that everything that is required in that section is performed in your hook function).
 
-When exploring the main script to find the best hook function to inject your
-own scripting focus on the "initialize" and "create-image" functions starting with the first "if fire-hook" line.
+When exploring the main script to find the best hook function to inject your own scripting focus on the "initialize" and "create-image" functions starting with the first "if fire-hook" line.
 
 ## CONTAMINATION
-paczfs tries to minimize impact to the host system, but specifically aims to
-create identical images given the same config file (not necessarily bitwise
-equal, but functionally equivalent), so it is careful to not copy things like
-the current system locale into the new image. This is an aspirational goal at
-this point and has not been confirmed. The reason paczfs tries to be careful
-not to contaminate the new image is so the user has a fully defined starting
-point for using hook functions to specifically customize as needed with no
-surprises (ie. the same image result no matter how the host computer is set up).
+paczfs tries to minimize impact to the host system, but specifically aims to create identical images given the same config file (not necessarily bitwise equal, but functionally equivalent), so it is careful to not copy things like the current system locale into the new image. This is an aspirational goal at this point and has not been confirmed. The reason paczfs tries to be careful not to contaminate the new image is so the user has a fully defined starting point for using hook functions to specifically customize as needed with no surprises (ie. the same image result no matter how the host computer is set up).
 
-One exception to this philosophy of keeping the image "clean" is that this
-script and the configuration file (if provided) will be saved to the
-/etc/paczfs directory on the newly created image and all packages listed in the `WORKSTATION_PKGS` array will be installed.
+One exception to this philosophy of keeping the image "clean" is that this script and the configuration file (if provided) will be saved to the /etc/paczfs directory on the newly created image and all packages listed in the `WORKSTATION_PKGS` array will be installed.
 
 There are a couple more conveniences such as copying files from /etc/skel into /root, setting the timezone to UTC, and starting systemd-networkd/systemd-resolved (but note that none of these things are linked in any way to the host system).
 
 ## ROOT FILESYSTEM
-Because the root filesystem in on ZFS, you can snapshot and clone the root
-filesystem and reboot into any clone instantly (due to ZFS Copy On Write 
-(COW) functionality). But perhaps more importantly, you can update images
-using zfs send and receive functionality.
+Paradoxically, by default, the zfs systemd unit files are not enabled because the kernel modules are loaded and datesets mounted very early in the boot stage (before the systemd unit files are even available) so they aren't needed. Be aware of this if you have a use case that requires them to be enabled (in case the results aren't what you expected). Also note that this means the zfs evend daemen service is not enabled (we still haven't gotten around to investigating what this does), so enable it manually if you need it (and then open an issue at github to tell us what you use it for).
 
-Set the zpool "bootfs" property to select a dataset to mount on /root at
-reboot, and then use the /etc/fstab file on that dataset to perform other
-mounts (and then reboot).
+Because the root filesystem in on ZFS, you can snapshot and clone the root filesystem and reboot into any clone instantly (due to ZFS Copy On Write (COW) functionality). But perhaps more importantly, you can update images using zfs send and receive functionality.
+
+Set the zpool "bootfs" property (ie. `zpool set bootfs=zroot/dataset zroot`) to select a dataset to mount on / (as the root filesystem) on the next boot. 
 
 ```
-zpool set "bootfs=zroot/system/clone_of_default" zroot
+zfs snapshot zroot/system/default@clone # create a snapshot (you can only clone snapshots)
+zfs clone zroot/system/default@clone zroot/system/clone # clone the snapshot
+zpool set "bootfs=zroot/system/clone" zroot # set the "bootfs" property on the pool to the clone
 ```
-By default, the zpool "mountpoint" is set to legacy, so zfs mounts are handled by the /etc/fstab file instead of zfs. This is a subtle but important point. 
+If you clone the current root filesystem and then set "bootfs" to the clone then all of the filesystems that are currently mounted will be mounted when you reboot with the clone mounted as the root filesystem. This is because the zpool is created with the "mountpoint" option set to "legacy" which disables automatic mounting and unmounting by zfs (it is handled by the "legacy" /etc/fstab file).
+
+By default, the zpool "mountpoint" is set to legacy, so zfs mounts are handled by the /etc/fstab file instead of zfs. This is a subtle but important point. The root filesystem should always be set to legacy and will will be mounted during early boot along with all datasets which have a mountpoint defined and also have the "canmount" property set to "on". Generally this is not what we want. By setting the "mountpoint" property to legacy mounting the filesystem is completely controlled by the /etc/fstab file and not zfs (all possible root datasets should always have the "mountpoint" property set to legacy.
+
+Another possability is to set the zfs mountpoint property to a real path but set the "canmount" property to "noauto". In this case, the dataset will never be automatically mounted, but can still be mounted with the `zfs mount` command manually.
+
+The guidance above focuses on how to switch the root filesystems and then select what else gets mounted selectively based on which root filesystem was selected (ie. by referring to the /etc/fstab on whatever was selected). To achieve the opposite effect of making sure that a zfs dataset is mounted no matter which root filesystem is selected you can set both the "mountpoint" property to a valid path, and "canmount=on" and they will be mounted during the early boot process immediately after the root filesystem is mounted (regardless of which root filesystem is selected).
 
 
-In theory, but not yet extensively in practice, ZFS can store data encrypted,
-so ZFS not only provides a strong solution to offsite back-ups, it may also
-offer a strong solution to system update management (ie. poll for updates, then
-receive to a clone, and reboot into the clone). If the update is
-just changing some files ZFS will be able to distribute differential updates
-extremely effeciently (if it is a whole new dataset the whole thing will have
-to be transferred).
+In theory, but not yet extensively in practice, ZFS can store data encrypted, so ZFS not only provides a strong solution to offsite back-ups, it may also offer a strong solution to system update management (ie. poll for updates, clone current root fs and receive differential update against the clone, and reboot into the clone with automatic recovery back to the previous root on failure).
 
-The purpose of this script is to provide a test-bed to determine whether the
-practical benefits of ZFS as a root filesystem are justifiable and whether
-the performance is adequate (especially around ram requirements).
+The purpose of this script is to provide a test-bed to determine whether the practical benefits of ZFS as a root filesystem are justifiable and whether the performance is adequate (especially around ram requirements).
 
 ## What is the Point (Long Answer)
 We like ZFS, specifically because it's ability to snapshot and clone datasets, as well as it's ability to send/receive snapshot differentials. Recently OpenZFS introduced encryption, leading to the possibility of encrypted offsite backups on untrusted servers (our real end-goal). Probably not completely untrusted servers, but perhaps "trusted backup archives" (trusted servers that store data they aren't able to access).
@@ -226,39 +191,27 @@ Although suspicious at first, we have grown to really like systemd. Similar (in 
 
 Systemd includes `machinectl` which is a utility to inspect and manage running containers. `systemd-nspawn` by default searches for container images or root directories in the /var/lib/machines folder and `machinectl` has some built-in functionality to prepare this folder as a btrfs volume (so it can use clones and snapshots to clone containers). We don't have much experience with btrfs and are already focused on a zfs based infrastructure so we don't use the btrfs support built into `machinectl` (we expect someday systemd will provide a zfs option, or use zfs if the /var/lib/machines directory is in a zfs dataset). The reason we want our container directories on zfs is so we can use `zfs send` to distribute updates from development servers to production servers.
 
-This script is the result of adopting the CoreOS updating strategy without the
-CoreOS limitations. It is envisioned that to create a production server image
-you would first use this script to create a "development image" to use to
-set-up the server exactly as needed (with the benefit of bash-completion,
-manual documents, and other utilities not strictly needed in the production
-server). You can "boot" your test production server using systemd-nspawn. When
-you are happy with it use "zpool set bootfs=zroot/system/new_image zroot"
-(adjusting as necessary to match the actual dataset and zpool name), and then
-reboot. After rebooting you can delete the original boot dataset (resulting in
-a bare bones customized OS image). Updates to production images can then be
-distributed as ZFS differential snapshots (using zfs send/receive). The default
-configuration includes seperate datasets for /home /root /srv /var/lib/machines
-and /var/lib/postgresql (so these will be the same no matter which root
-filesystem you are booted into). Use the "create-zfs-datasets" hook function
-to override this default configuration (see below).
+This script is the result of adopting the CoreOS updating strategy without the CoreOS limitations. It is envisioned that to create a production server image you would first use this script to create a "development image" to use to
+set-up the server exactly as needed (with the benefit of bash-completion, manual documents, and other utilities not strictly needed in the production server). You can "boot" your test production server using systemd-nspawn. When you are happy with it use "zpool set bootfs=zroot/system/new_image zroot" (adjusting as necessary to match the actual dataset and zpool name), and then reboot. After rebooting you can delete the original boot dataset (resulting in a bare bones customized OS image). Updates to production images can then be distributed as ZFS differential snapshots (using zfs send/receive). The default configuration includes seperate datasets for /home /root /srv /var/lib/machines and /var/lib/postgresql (so these will be the same no matter which root filesystem you are booted into). Use the "create-zfs-datasets" hook function to override this default configuration (see below).
 
-`systemd-nspawn` has some built-in functionality to use btrfs as a backing
-filesystem for containers (in the /var/lib/machines directory) which allows
-cloning and snapshotting, but we were never comfortable with btrfs the same
-way we are with zfs (but we also don't have much btrfs experience). But
-for the purposes of managing containers in an image created from this script,
-you can create a container directory with:
-    "zfs create zroot/machines/new_container"
+`systemd-nspawn` has some built-in functionality to use btrfs as a backing filesystem for containers (in the /var/lib/machines directory) which allows cloning and snapshotting, but we were never comfortable with btrfs the same way we are with zfs (but we also don't have much btrfs experience). But for the purposes of managing containers in an image created from this script, you can create a container directory with:
+
+```
+zfs create zroot/machines/new_container
+```
 snapshot a container directory with:
-    "zfs snapshot zroot/machines/new_container@snap_name"
-or clone a container directory with
-    "zfs clone zroot/machines/new_container@snap_name zroot/machines/clone_container"
+
+```
+zfs snapshot zroot/machines/new_container@snap_name
+```
+or clone a container directory with:
+
+```
+zfs clone zroot/machines/new_container@snap_name zroot/machines/clone_container
+```
 
 ## DEPENDENCIES
-zfs must be installed on the server running this script along with the following
-utilities and their dependencies. The version values below show version on
-ArchLinux of each utility that this script was created/tested with, grouped by
-the ArchLinux package containing them.
+zfs must be installed on the server running this script along with the following utilities and their dependencies. The version values below show version on ArchLinux of each utility that this script was created/tested with, grouped by the ArchLinux package containing them.
     
 - core/bash=4.4.019-1
 	- bash (4.4.19)
