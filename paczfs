@@ -154,7 +154,7 @@ function print-help() {
 		${name} (${version}) Copyright 2018 Varasys Limited (${license} License)
 
 		pacstrap (bootstsrap) and customize ArchLinux server images with OpenZFS root 
-		filesystem (see https://github.com/varasys/${name} for more documentation).
+		filesystem .
 
 		This script installs an ArchLinux image using ZFS for the root filesystem on
 		a block device or to an image file (raw/img, vdi, qcow, qcow2) along with a
@@ -162,13 +162,6 @@ function print-help() {
 		it should boot up on any machine which uses EFI to boot. Patches are welcome
 		from anybody who knows how to make it boot on BIOS machines (it should not be
 		hard, but I'm exhausted at this point and I only need EFI).
-
-		The benefit of ZFS is that it combines the best parts of a Copy On Write (COW)
-		filesystem (ie. instant snapshots and clones) with differential backup
-		capabilities. ZFS has an extremely effecient mechanism for transferring bitwise
-		differentials between snapshots without having to actually scan the filesystem
-		(similar, but with a very different underlying mechanism, to rsync except at
-		the "ZFS dataset" level instead of the file level).
 
 		If you just want to use ZFS for your data, there is no need to use this script.
 		This script specifically sets up ZFS as the root filesystem (ie. "/"). The
@@ -180,45 +173,10 @@ function print-help() {
 		Also, this probably has more benefit as a "hypervisor-like" headless VPS server
 		than on a laptop OS (something like VirtualBox is likely much more appropriate
 		for OS snapshotting and cloning on a laptop).
+		
+		See https://github.com/varasys/${name} for more documentation.
 
-		This script is the result of adopting the CoreOS updating strategy without the
-		CoreOS limitations. It is envisioned that to create a production server image
-		you would first use this script to create a "development image" to use to
-		set-up the server exactly as needed (with the benefit of bash-completion,
-		manual documents, and other utilities not strictly needed in the production
-		server). You can "boot" your test production server using systemd-nspawn. When
-		you are happy with it use "zpool set bootfs=zroot/system/new_image zroot"
-		(adjusting as necessary to match the actual dataset and zpool name), and then
-		reboot. After rebooting you can delete the original boot dataset (resulting in
-		a bare bones customized OS image). Updates to production images can then be
-		distributed as ZFS differential snapshots (using zfs send/receive). The default
-		configuration includes seperate datasets for /home /root /srv /var/lib/machines
-		and /var/lib/postgresql (so these will be the same no matter which root
-		filesystem you are booted into). Use the "create-zfs-datasets" hook function
-		to override this default configuration (see below).
-
-		systemd-nspawn has some built-in functionality to use btrfs as a backing
-		filesystem for containers (in the /var/lib/machines directory) which allows
-		cloning and snapshotting, but we were never confortable with btrfs the same
-		way we are with zfs (but we also don't have much btrfs experience). But
-		for the purposes of managing containers in an image created from this script,
-		you can create a container directory with:
-			"zfs create zroot/machines/new_container"
-		snapshot a container directory with:
-			"zfs snapshot zroot/machines/new_container@snap_name"
-		or clone a container directory with
-			"zfs clone zroot/machines/new_container@snap_name zroot/machines/clone_container"
-
-		The image may be customized by setting environment variables and/or defining
-		hook functions which run at pre-determined times while the image is being
-		created (refer to configuration section). A very common example is to use a
-		hook function to copy ssh authorized_keys to the image, or to disable root
-		password login (the default image has an empty password for root). The default
-		configuration file (${name} -C > config_file) includes a list of all available
-		hook functions commented out. To use a hook function, uncomment it, and then
-		define whatever script actions you require.
-
-		## USAGE (also read configuration):
+		## USAGE:
 		Create a new image using default configuration and no options (will create .img
 		file in current directory):
 			${name}
@@ -240,162 +198,22 @@ function print-help() {
 		Show version:
 			${name} -V
 
-		## CONFIGURATION
-		If a configuration file is provided it is sourced before script execution. This
-		has the same effect as literally cutting and pasting the config file into
-		the script. The point is that: 1) the config file uses bash syntax, and 2) the
-		config file is sourced (or included into this script) during execution.
+		## OPTIONS:
+		The "-d" option accepts the following argumants:
+		    none - no debugging
+			verbose - show sub-command stdout
+			trace - use "set -x" (detailed debug output)
+			debug - use "set -x" and open a bash subshell on error
+		The "-e" option allows you to specify a command to run on error (ie. bash)
+		The "-v" option is equivelent to "-d verbose -e bash" (show reasonable
+		output, but open a sub-shell on error)
+		
+		Note that the script defines a "bash" function which will be called if "-e bash"
+		is used. The purpose of defining this function instead of calling bash directly
+		is to set-up a very colorful prompt to remind the user they are a a sub-shell of
+		the running script. If you don't want this behavior use the "-e" option with
+		the complete bash path.
 
-		The config file is used to set environment variables and define "hook
-		functions", which are user defined functions which are run at pre-determined times
-		throughout the image creation (see below).
-
-		The command line options to ${name} only control debug and configuration settings.
-		Environment variables are used to configure the final image. The environment
-		variables may be set on the command line prior to executing ${name}, or can be set
-		in the config file (initially created with "${name} -C > out_file"). The priority
-		of variables is the config file first, command line second, and defaults third. The
-		second example above (creating an image for VirtualBox) demonstrates setting the
-		environment variables on the command line (VDI_FILE is set prior to executing
-		${name}).
-
-		In addition to defining environment variables, hook functions may be defined in
-		the configuration file. "Hook functions" are functions which are functions which
-		the script will execute if they are defined in the config file. The default
-		configuration template has some examples (commented out) of hook functions
-		to copy ssh keys and set the default keyboard layout.
-
-		Run "${name} -C" to see a configuration file template listing the applicable
-		environment variables and hook functions. Uncomment and adjust the variables
-		and hook functions as needed.
-
-		Note that ${name} will "evaluate" each variable (using eval), so it is okay to
-		"embed" other variables in single quotes (ie. VDI_FILE='\${SUFFIX}.vdi'). The
-		single quotes will prevent the shell from expanding the variable (but ${name}
-		will still expand it when needed, which is typically after the referenced
-		variable has been set).
-
-		To see when each hook function will be executed scan the script for lines that
-		say 'if fire-hook ' which will fire the hook listed in the if statement. You
-		can prevent the pre-defined code from executing by setting "handled=true" in
-		the hook function (in which case you are responsible for ensuring that
-		everything that is required in that section is performed in your hook function).
-
-		When exploring the main script to find the best hook function to inject your
-		own scripting focus on the "create-image" function starting with the first
-		"if fire-hook" line.
-
-		## CONTAMINATION
-		${name} tries to minimize impact to the host system, but specifically aims to
-		create identical images given the same config file (not necissarely bitwise
-		equal, but functionally equivelent), so it is careful to not copy things like
-		the current system locale into the new image. This is an aspirational goal at
-		this point and has not been confirmed. The reason ${name} tries to be careful
-		not to contaminate the new image is so the user has a fully defined starting
-		point for using hook functions to specifically customize as needed with no
-		surprises (ie. the resulting image will match the assumed starting point in
-		the ArchLinux documentation).
-
-		One exception to this philosophy of keeping the image "clean" is that this
-		script and the configuration file (if provided) will be saved to the
-		/etc/${name} directory on the newly created image.
-
-		## ROOT FILESYSTEM
-		Because the root filesystem in on ZFS, you can snapshot and clone the root
-		filesystem and reboot into any clone instantly (due to ZFS Copy On Write 
-		(COW) functionality). But perhaps more importantly, you can update images
-		using zfs send and receive funcionality.
-
-		Set the zpool "bootfs" property to select a dataset to mount on /root at
-		reboot, and then use the /etc/fstab file on that dataset to perform other
-		mounts (and then reboot).
-
-		In theory, but not yet extensively in practice, ZFS can store data encrypted,
-		so ZFS not only provides a strong solution to offsite back-ups, it may also
-		offer a strong solution to system update management (ie. poll for updates, then
-		receive to a clone, and reboot into the clone). If the update is
-		just changing some files ZFS will be able to distribute differential updates
-		extremely effeciently (if it is a whole new dataset the whole thing will have
-		to be transferred).
-
-		The purpose of this script is to provide a test-bed to determine whether the
-		practical benefits of ZFS as a root filesystem are justifiable and whether
-		the performance is adequate (especially around ram requirements).
-
-		## DEPENDENCIES
-		zfs must be installed on the server running this script along with the following
-		utilities and their dependencies. The version values below show version on
-		ArchLinux of each utility that this script was created/tested with, grouped by
-		the ArchLinux package containing them (but the script should work on any system
-		with these utilities).
-			core/bash=4.4.019-1
-			- bash (4.4.19)
-			core/pacman=5.0.2-2 (ArchLinux specific, but pkgs include in most linux distros)
-			- pacman (5.0.2-2)
-			- pacman-key (5.0.2-2)
-			- pacstrap (n/a)
-			core/coreutils=8.29-1
-			- truncate (n/a)
-			core/util-linux=2.31.1-1
-			- lsblk (2.31.1)
-			- blkid (2.31.1)
-			- losetup (2.31.1)
-			- mkswap (2.31.1)
-			extra/gptfdisk=1.0.3-1
-			- gdisk (1.0.3)
-			extra/parted=3.2-6
-			- partprobe (3.2)
-			core/dosfstools=4.1-1
-			- mkfs.vfat (4.1)
-			archzfs/zfs-utils-common=0.7.6-3
-			- zpool (n/a)
-			- zfs (n/a)
-			extra/qemu-headless=2.11.1-2 (or extra/qemu)
-			- qemu-img (2.11.1) (only needed to create vdi, qcow, or qcow2 images)
-
-		To setup these dependencies on an ArchLinux system first add the following to
-		/etc/pacman.d/mirrorlist (because the zfs package is not hosted by ArchLinux):
-		[archzfs]
-		Server = http://archzfs.com/\$repo/\$arch
-
-		Then run the following, noting that that this will install a complete
-		development environment to compile the zfs kernal modules, will take time and
-		install alot of additional dependencies (so do this in a virtual machine if
-		possible and then snapshot the result so you can revert to a clean starting
-		point if needed):
-			pacman -Syy
-			pacman -S --needed --noconfirm \\
-				bash pacman coreutils util-linux gptfdisk parted \\
-				dosfstools zfs-dkms zfs-utils-common
-
-		On non-ArchLinux systems just find and install the package containing each of
-		these dependencies (many distros include a packages with the pacman scripts).
-
-		## TODO
-		The following functionality is planned, but not incorporated yet. Please
-		raise an issue at https://github.com/varasys/${name} if you are interested
-		in contributing to further development:
-			- dm-veritas image validation (still considering whether this is
-			applicable/worthwhile, doesn't look too hard on the surface)
-			- BIOS boot loading support (it should just be a couple lines of script, but
-			I don't know what they are and don't need BIOS support myself, but happy to
-			implement if someone explains what is required or submits a patch)
-			- system hi-jack support (to install on VPS that can't upload images by
-			unmounting current root and overwriting boot device with image from this
-			script)
-			- root filesystem encryption support (in theory encrypted root is supported,
-			but complicates boot loading and probably has no strong use case with
-			respect to the root filesystem)
-			(note that all other non-root datasets can already be encrypted)
-			- allow virtual machines to boot from the same rootfs as the running system
-			(or any of it's snapshots) (the issue is that VMs usually want images,
-			unlike containers which are happy with directories, so how to allow the
-			system to present itself to a VM as an image (may not be possible) maybe
-			something device mapper could help with?)
-			- Create ArchLinux User Repository (AUR) for this script (eventually to become
-			a pkg if found useful (should be simple I think))
-
-		Thanks for your time, and we hope you have a pleasant experience ;-)
 		EOF
 }
 
