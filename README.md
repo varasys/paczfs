@@ -10,21 +10,18 @@ The practical result is that it creates an ArchLinux image which can be booted o
 
 # Getting Started
 
-To download paczfs and install the dependencies, run the following as root from within a bare metal or virtual machine booted into an ArchLinux installation (not from the ArchLinux boot iso directly).
-
-Note that this will install a full development environment to compile the zfs kernel drivers and only needs to be done once.
+To download paczfs from the github master repository:
 
 ```
 curl -LO https://raw.githubusercontent.com/varasys/paczfs/master/paczfs
-pacman -Syy
-pacman -S --needed --noconfirm bash pacman coreutils util-linux gptfdisk \
-	parted dosfstools zfs-dkms zfs-utils-common
 ```
 To create an image using default settings run the following (but don't run it yet, at least read to the end of this section):
 
 ```
 ./paczfs
 ```
+If any dependancies are not installed, you will be prompted for confirmation to install them (use the `-I` option to suppress the prompt).
+
 This will create an image file named "paczfs-${SUFFIX}.img" (where the `SUFFIX=$( date +%s)` to act as a sort of timestamp) which will be a 20 GB sparse file (using about 900MB actual space). 
 
 A customized image file can be created by specifying a configuration file to do things such as copy ssh keys, change keyboard layouts, create VDI, QCOW, or QCOW2 images or to write the image directly to a block device (such as directly to a hard drive) instead of a file.
@@ -57,9 +54,98 @@ If the CACHE_PATH variable has a colon ":" then `sshfs` will be used to mount it
 
 If you haven't used ArchLinux before it is important to understand that this script is very deliberately designed to install the smallest practical (but useful) system possible as a base so you can have total control over anything extra, so lots of what you are used to probably won't be installed by default (but is most likely available).
 
+For example, unless you explicitly install them, the `shutdown` and `reboot` commands aren't available (so use `systemctl poweroff` and `systemctl reboot` instead). It is a bit frustrating at first, but is ultimately very useful because it forces you to understand which tools you are actually using (since sometimes packages try and maintain consistency to use sym-links or other compatibility tricks that obfuscate what is really happening).
+
 The environment variable WORKSTATION_PKGS defines a list of packages we have chosen to add to the image in addition to the ArchLinux base package (things we consider to be core packages). Feel free to customize per your liking.
 
 Note that one of the things included in the default WORKSTATION_PKGS list is the `pkgfile` utility which can be used to find out which ArchLinux package a file is located in (ie. to find out which package to install to get a specific command).
+
+The `paczfs` script takes snapshots during image creation at the following three times.
+
+1. zroot@miniroot - after the base system is installed (but without a kernel)
+2. zroot@bootable - after the kernel and bootloader is installed
+3. zroot@workstation - after the packages in the `WORKSTATION_PKGS` array is installed
+
+When booting into an image for the first time the "zroot@workstation" snapshot will be active, and you can always get back to this state by cloning this snapshot and booting into the clone as shown in the following example.
+
+```
+zfs clone zroot/system/default@workstation zroot/system/fresh_start
+zpool set bootfs=zroot/system/fresh_start zroot
+systemctl reboot
+```
+It is also possible to rollback to this state (but probably not on a dataset that is currently mounted so probably easier to clone is described above):
+
+```
+zfs -r zroot/system/default@workstation
+```
+
+The "miniroot" snapshot can be cloned and used in containers that require systemd. By default systemd looks for machine directories in the /var/lib/machines directory, so the paczfs script creates a zroot/machines directory at that mount location (note that this is a conflict with using btrfs filesystem). For example, the following will create and boot into a clone using the miniroot snapshot.
+
+```
+zfs clone zroot/system/default@miniroot zroot/machines/miniroot_clone
+systemd-nspawn -b -M miniroot_clone --bind=/root --bind=/var/cache/pacman/pkg
+```
+We find developing containers using this miniroot and `pacman` much more more intuitive and straightforward than trying to write docker files or work with upstream docker images that don't exactly match our use cases. Basically just write a bash script to install and configure whatever you want in the container. When your are done you can lock it down a little by uninstalling `pacman`. You can share data by bind mounting directories into multiple containers and the `systemd-resolved.service` will include containers in dns lookups (but we always try to prefer unix sockets for inter-container communication since we think securing ip networking is too complex so we just try and avoid it completely as much as possible).
+
+The "bootable" snapshot represents the minimum requirements to boot the machine, and represents a very "locked down" state (since so little is installed). This snapshot can be cloned to use as a minimal root filesystem. To get even more minimalistic you could, and probably should, uninstall `pacman` from production images after installing what you need.
+
+## VERY IMPORTANT
+This part is the most important thing to understand in order to understand how to boot into different root filesystems. Remember that this configuration is not well tested at this point (which is why we are trying to provide detailed explanations).
+
+There are a couple ways to configure how and where zfs datasets are mounted and whether they should be mounted according to the /etc/fstab file or using `zfs mount`.
+
+Since not much of the online discussion (that we have seen) focuses on the implications for booting into multiple root filesystems, this deserves a little attention to understand why we implemented it the way we did.
+
+To make things clear we will start with a quick summary of how/when zfs datasets are mounted. But first it is important to agree to some terminology. A "pool" is what is listed by the `zpool list` command, and a "dataset" is what is listed by the `zfs list` command, and a "mountpoint" is a physical directory onto which something can be mounted.
+
+When this script creates the original zfs pool it sets the following property on the pool:
+
+- bootfs=${POOL_NAME}/system/default
+
+and sets the following defaults for all datasets created on the pool:
+
+- mountpoint=legacy
+- canmount=noauto
+
+The dataset "mountpoint" property is used to determine whether a dataset should be mounted using the system `mount -t zfs` command or using the zfs `zfs mount` command. In other words whether mounting the dataset is the responsibility of the system (using the /etc/fstab file) or zfs (using scripts such as zfs-mount.service).
+
+If the "mountpoint" property is set to the special word "legacy" then the system `mount -t zfs` command must be used to manually mount the filesystem and it will be automatically mounted on boot if it is listed in the /etc/fstab file. But in this case, the `zfs mount` command can't be used to mount the filesystem and zfs won't be able to automount it (since zfs doesn't know the mountpoint). Also, the "canmount" property is ignored (if a dataset is listed in the /etc/fstab file it will be mounted by the system regardless of the "canmount" property).
+
+On the other hand, if the "mountpoint" property is set to a valid mountpoint, the opposite is true. The dataset can only be mounted with the zfs `zfs mount` command (the system `mount -t zfs` command will raise an error). In this case, the "zfs-mount.service" unit runs the `zfs mount -a` line where the "-a" option mounts all datasets which have the "mountpoint" property set (unless it is set to "legacy") and the "canmount" property set to "on". If "canmount=noauto" the dataset can still be mounted manually using the `zfs mount` command but won't be mounted automatically by the `zfs mount -a` command, and if the "canmount=no" the dataset can't be mounted.
+
+In a typical installation the "zfs-import.target" "zfs-import-cache.service" and "zfs-import-scan.service" systemd unit files are required to import the pools, but in this case, these operations are performed during early boot (as described below), so these these unit files are not enabled by default.
+
+The two other zfs systemd unit files which are not enabled by default are the "zfs-share.service" and "zfs-zed.service", but you can enable them if needed. Note that the "zfs.target" unit is enabled by default.
+
+So, in summary:
+- if "mountpoint=legacy" the /etc/fstab file will be used to determine whether/where to mount the dataset at startup
+- if the "mountpoint" property is set to a valid path, and "canmount=on" the dataset will be mounted by the "zfs-mount.service" at startup
+
+By default, this script sets the default "mountpoint" property of the pool to "legacy", which means that all zfs datasets inherit it and mounts are performed using the /etc/fstab file in whatever root filesystem was booted into. It is important to understand that if you clone a root filesystem and then boot into it the reason it will have all the same mounts is because the /etc/fstab file was included in the clone. If the clone should have different mounts edit the /etc/fstab file in the clone as required.
+
+On the other hand, if you set the "mountpoint" property of a dataset to a valid path and set "canmount=on" the dataset will be mounted when you boot into any root filesystem that has the "zfs-mount.service" enabled.
+
+Everything described above is valid for all systems with zfs regardless of whether they use a zfs root filesystem. To use zfs as the root filesystem we need to add the zfs kernel modules and startup script to the initram filesystem (which is temporary ram based root filesystem in used to initialize the real root filesystem).
+
+Think about it this way; the zfs kernel modules are stored on the root filesystem, so how can be they be loaded into the kernel before the root filesystem is mounted; but how can the root filesystem be mounted if the kernel doesn't have the zfs kernel drivers?
+
+The solution is for the kernel to first mount a temporary ram based filesystem which includes whatever modules and scripts are required to mount the real root filesystem, and then pivot to the real root filesystem. This temporary filesystem is stored in an image file in the EFI partition which is formatted with fat32 which the kernel can read without special help.
+
+Using an initramfs during bootup is normal and not specific to zfs, but to use zfs as the root filesystem we need to make sure that the kernel modules and zfs initialization script are included correctly in the initramfs image.
+
+The "magic" which actually loads the zfs drivers, imports the zpool, and mounts the selected root filesystem dataset (according to the zpool "bootfs" property) at boot time is the "zfs" script in the hooks directory of the initramfs image created by `mkinitcpio`. This operation is performed in the "prepare-initramfs" section of the script and includes copying the script located at /usr/lib/initcpio/hooks/zfs into the initramfs.
+
+This script uses logic to provide several ways to specify how to select a zfs root filestem using various linux kernel arguments (ie. zfs=auto, zfs=bootfs, root=ZFS=, etc). Type `mkinitcpio --hookhelp zfs` (on a machine that has the mkinitcpio and zfs packages installed) to see the various options that can be appended to the linux command line (in /etc/default/grub).
+
+The default ArchLinux zfs installation tries to use the "root=ZFS=pool/dataset" method, but in the "install-grub" section of the script we use `sed` to change this to the "zfs=bootfs" method. The reason is because we want to be able to use the zpool "bootfs" property to select a root filesystem (instead of having to edit grub configuration files).
+
+The only problem with the "zfs=bootfs" method is that the default initramfs zfs scripts performs  a check to make sure the /etc/fstab on the initramfs contains an entry for each dataset with the "mountpoint" property set to "legacy" before mounting it. Although this is a reasonable check, for our use case it is not appropriate. There is a `sed` command in the "prepare-initramfs" section of the `paczfs` script which modifies the zfs initialization script to short circuit this check (so you won't need to update the initramfs /etc/initfs for each dataset that you want to be able to boot into).
+
+In summary, if you are happy to control everything using the "/etc/fstab" file in each root filesystem everything should already be set-up (just change the zpool "bootfs" property and reboot). If you want to try something else, hopefully this explanation provides a good explanation of the starting point used by the `paczfs` script.
+
+Note that it is important for only one zpool to have the "bootfs" property set, because the default zfs initramfs scripts try to mount the "bootfs" on the first pool detected that has one.
+
+If there is a problem mounting the root filesystem you will drop into a shell with some basic tools you can use to try and troubleshoot the problem (including the `zpool` and `zfs` programs).
 
 # What is the Point (short answer)
 
@@ -138,6 +224,8 @@ In theory, but not yet extensively in practice, ZFS can store data encrypted, so
 The purpose of this script is to provide a test-bed to determine whether the practical benefits of ZFS as a root filesystem are justifiable and whether the performance is adequate (especially around ram requirements).
 
 ## What is the Point (Long Answer)
+This may be a bit of rambling, but we want to explain how we got here so we can get feedback from others and why we think this combination of technologies may have some unique benefits.
+
 We like ZFS, specifically because it's ability to snapshot and clone datasets, as well as it's ability to send/receive snapshot differentials. Recently OpenZFS introduced encryption, leading to the possibility of encrypted offsite backups on untrusted servers (our real end-goal). Probably not completely untrusted servers, but perhaps "trusted backup archives" (trusted servers that store data they aren't able to access).
 
 We do a lot of virtualization and containerization and like the CoreOS philosophy of a slim, standardized, and generally locked-down "VPS hypervisor" (technically it is not a hypervisor, but the idea is the same that the only thing it does is manage containers). But we were frustrated that CoreOS didn't necessarily have the things we wanted (such as sshfs) baked-in, and some things (such as ZFS) had overly complicated processes to get working (see https://github.com/varasys/corezfs for example).
@@ -150,8 +238,7 @@ We found that the `pacman` package manager and ArchLinux repositories struck a p
 
 - official packages have minimal configuration, which is not good for recreational users (where .deb and .rpm are easier), but good for developers (like us) because it makes the upstream development document more relevant (ie. because you don't have to consider as many customizations from the package manager)
 
-- it uses a "web of trust" trust model, which by default, includes five keys (pre-selected/installed by ArchLinux) and requires 3 of 5 signatures for a package to be considered trusted by default. So theoretically, it is possible that a fracture in the ArchLinux community would "break" the global ArchLinux infrastructure. For example if the developers in control of at least three of these five keys won't sign the core packages. We LOVE this feature (but also acknowledge that others may see it as a bug). This description is probably technically wrong or inaccurate, but the point is valid and relevant because in that situation we could change our trust model and selectively trust any other combinations of signatures to keep going.
-
+- it uses a "web of trust" trust model, which by default, includes five master keys pre-selected/installed by ArchLinux of five key developers which are used to sign the key of each trusted package developer (which are used to ultimately sign each package). If a package developer's key is signed by at least three of the five master keys it is considered trusted. This is just the default (and what most people use), but the point is that it is very customizable at a fine grained level so your production servers can use a trust model that only installs packages signed by your own master key and reject all other keys (ie. you would distribute packages from your own repository which first validates the source signature and then re-signs it with your master key).
 
 The last point above deserves special explanation. We believe that the days of centralized CAs (ie. trust all of the root CAs installed by default) are numbered. Very soon it will not be possible for everyone to agree on common sets of trusted CAs. Several technologies are already anticipating this (such as DNSSEC) and being trialed and implemented with varying success. Although the pgp "web of trust" model has been around for along time, it is still not generally well known or well understood, but is very likely one of the fundamental technologies for the "post centralized CA" era.
 

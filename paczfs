@@ -271,8 +271,15 @@ function create-image() {
 		done
 		unset pkg
 		if (( ${#missing_pkgs[@]} > 0 )); then
-			die "missing required packages - run again with \"-s\" option to try and install them"
+			
+			if [[ "${auto_install:-}" = true ]] || { printf "install missing packages [Y|n]: "; read confirm; [[ ${confirm} = "Y" ]]; }; then
+				pacman -Syy
+				pacman -S --needed --noconfirm "${missing_pkgs[@]}"
+			else
+				die "missing required packages"
+			fi
 		fi
+		unset confirm
 		zpool list "${POOL_NAME}" &> "/dev/null" && die "pool ${POOL_NAME} already exists"
 		[[ -b "$( losetup -f )" ]] || die "no free loop devices available (they must be bind mounted if running inside a container)"
 		mount | grep -q "^${CHROOT_PATH}" && die "existing mounts on ${CHROOT_PATH}"
@@ -307,7 +314,7 @@ function create-image() {
 	declare -rx ZPOOL_VDEV_NAME_PATH=1 # if this is 1 the zfs command will output full device paths (instead of just device names)
 	if fire-hook "prepare-zfs-pool"; then
 		zpool create -R "${CHROOT_PATH}" -O "relatime=on" -O "compression=lz4" -O "acltype=posixacl" \
-			-O "xattr=sa" -o "ashift=12" -O "mountpoint=legacy" "${POOL_NAME}" "${zfs_loop_dev}"
+			-O "xattr=sa" -o "ashift=12" -O "mountpoint=legacy" -O "canmount=noauto" "${POOL_NAME}" "${zfs_loop_dev}"
 		add-tear-down "zpool export ${POOL_NAME}"
 		declare -rx zfs_id=$( zpool get -H -o "value" "guid" "${POOL_NAME}" )
 		zpool export "${POOL_NAME}"
@@ -321,21 +328,20 @@ function create-image() {
 	if fire-hook "prepare-directories"; then
 		add-tear-down "umount -R ${CHROOT_PATH}"
 		
-		zfs create -o "canmount=noauto" "${POOL_NAME}/system"
-		zfs create -o "mountpoint=/" "${POOL_NAME}/system/default"
-		zfs create "${POOL_NAME}/data"
+		zfs create -p "${POOL_NAME}/system/default"; mount -t zfs "${POOL_NAME}/system/default" "${CHROOT_PATH}/"
+		zfs create -p "${POOL_NAME}/data"
 		mkdir -p "${CHROOT_PATH}/root"
-		zfs create "${POOL_NAME}/data/root"; mount -t zfs "${POOL_NAME}/data/root" "${CHROOT_PATH}/root"
+		zfs create -p "${POOL_NAME}/data/root"; mount -t zfs "${POOL_NAME}/data/root" "${CHROOT_PATH}/root"
 		chmod 750 "${CHROOT_PATH}/root"
 		mkdir -p "${CHROOT_PATH}/home"
-		zfs create "${POOL_NAME}/data/home"; mount -t zfs "${POOL_NAME}/data/home" "${CHROOT_PATH}/home"
+		zfs create -p "${POOL_NAME}/data/home"; mount -t zfs "${POOL_NAME}/data/home" "${CHROOT_PATH}/home"
 		mkdir -p "${CHROOT_PATH}/srv"
-		zfs create "${POOL_NAME}/data/srv"; mount -t zfs "${POOL_NAME}/data/srv" "${CHROOT_PATH}/srv"
+		zfs create -p "${POOL_NAME}/data/srv"; mount -t zfs "${POOL_NAME}/data/srv" "${CHROOT_PATH}/srv"
 		mkdir -p "${CHROOT_PATH}/var/lib/machines"
-		zfs create -o "recordsize=8K" -o "primarycache=metadata" -o "logbias=throughput" "${POOL_NAME}/data/machines"
+		zfs create -p -o "recordsize=8K" -o "primarycache=metadata" -o "logbias=throughput" "${POOL_NAME}/data/machines"
 			mount -t zfs "${POOL_NAME}/data/machines" "${CHROOT_PATH}/var/lib/machines"
 		mkdir -p "${CHROOT_PATH}/var/lib/postgres"
-		zfs create -o "recordsize=8K" -o "primarycache=metadata" -o "logbias=throughput" "${POOL_NAME}/data/postgres"
+		zfs create -p -o "recordsize=8K" -o "primarycache=metadata" -o "logbias=throughput" "${POOL_NAME}/data/postgres"
 			mount -t zfs "${POOL_NAME}/data/postgres" "${CHROOT_PATH}/var/lib/postgres"
 		
 		zpool set bootfs="${POOL_NAME}/system/default" "${POOL_NAME}"
@@ -358,6 +364,7 @@ function create-image() {
 			DBPath      = ${1:-}/var/lib/pacman
 			CacheDir    = ${2:-/var/cache/pacman/pkg}
 			GPGDir      = ${1:-}/etc/pacman.d/gnupg
+			HookDir     = ${1:-}/etc/pacman.d/hooks/
 			LogFile     = ${1:-}/var/log/pacman.log
 
 			[core]
@@ -413,6 +420,7 @@ function create-image() {
 		cp "${0}" "${CHROOT_PATH}/usr/sbin/${0##*/}"
 		chmod 744 "${CHROOT_PATH}/usr/sbin/${0##*/}"
 		arch-chroot "${CHROOT_PATH}" systemctl enable "systemd-resolved.service" >&${verbose_fd}
+		ln -fs "../run/systemd/resolve/stub-resolv.conf" "${CHROOT_PATH}/etc/resolv.conf" # to actually use the systemd-resolved.service
 		arch-chroot "${CHROOT_PATH}" systemctl enable "systemd-networkd.service" >&${verbose_fd}
 		cat > "${CHROOT_PATH}/etc/systemd/network/20-dhcp.network" <<-EOF
 			[Match]
@@ -486,10 +494,18 @@ function create-image() {
 			arch-chroot "${CHROOT_PATH}" systemctl enable "sshd.socket" >&${verbose_fd}
 			arch-chroot "${CHROOT_PATH}" systemctl enable "rngd.service" >&${verbose_fd}
 			arch-chroot "${CHROOT_PATH}" systemctl enable "ntpd.service" >&${verbose_fd}
+			arch-chroot "${CHROOT_PATH}" systemctl enable "zfs-mount.service" >&${verbose_fd}
+			arch-chroot "${CHROOT_PATH}" systemctl enable "zfs.target" >&${verbose_fd}
 		fi
 	fi
 
 	if fire-hook "prepare-initramfs"; then
+		# normally the initcpio zfs runtime hook (which is the ash script that actually mounts the root filesystem on boot)
+		# only mounts legacy datasets if they are listed in the /etc/fstab file on the initramfs (which will be ro under /boot in a running system)
+		# we don't want to have to update this file for each potential boot partition, so the following skips this check
+		# and just mounts whatever is provided as the bootfs property of the pool (all zfs root datasets should have "mountpoint=legacy")
+		cp "${CHROOT_PATH}/usr/lib/initcpio/hooks/zfs" "${CHROOT_PATH}/usr/lib/initcpio/hooks/zfs.orig"
+		sed -i '/"legacy")/a \                mount -t zfs "${dataset}" "${node}\/"; continue' "${CHROOT_PATH}/usr/lib/initcpio/hooks/zfs"
 		echo "HOOKS=( base udev autodetect modconf block keyboard zfs filesystems )" >> "${CHROOT_PATH}/etc/mkinitcpio.conf"
 		arch-chroot "${CHROOT_PATH}" mkinitcpio -P >&${verbose_fd}
 	fi
@@ -501,8 +517,8 @@ function create-image() {
 		sed -i '/^GRUB_CMDLINE_LINUX_DEFAULT=/ { s,quiet,, }' "${CHROOT_PATH}/etc/default/grub"
 		arch-chroot "${CHROOT_PATH}" grub-mkconfig -o "/boot/grub/grub.cfg" >&${verbose_fd}
 		## by default grub2 uses root=ZFS=dataset method to select root (see mkinitcpio -H zfs)
-		## this changes the final config to use zfs=auto method (which will query the pool for the bootfs property)
-		sed -i 's|root=ZFS=[^ ]*|zfs=auto|' "${CHROOT_PATH}/boot/grub/grub.cfg"
+		## this changes the final config to use zfs=bootfs method (which will query the pool for the bootfs property)
+		sed -i 's|root=ZFS=[^ ]*|zfs=bootfs|' "${CHROOT_PATH}/boot/grub/grub.cfg"
 	fi
 
 	if fire-hook "snapshot-bootable"; then
@@ -532,24 +548,28 @@ function create-image() {
 
 	if fire-hook "save-image-file"; then
 		if [[ ! "${device}" -ef "${IMAGE_FILE:-}" && -n "${IMAGE_FILE:-}" ]]; then
+			inform "saving RAW: ${IMAGE_FILE}"
 			qemu-img convert -p -f raw -O raw "${device}" "${IMAGE_FILE}"
 		fi
 	fi
 	
 	if fire-hook "save-vdi-file"; then
 		if [[ -n "${VDI_FILE}" ]]; then
+			inform "saving VDI: ${VDI_FILE}"
 			qemu-img convert -p -f raw -O vdi "${device}" "${VDI_FILE}"
 		fi
 	fi
 	
 	if fire-hook "save-qcow-file"; then
 		if [[ -n "${QCOW_FILE}" ]]; then
+			inform "saving QCOW: ${QCOW_FILE}"
 			qemu-img convert -c -p -f raw -O qcow "${device}" "${QCOW_FILE}"
 		fi
 	fi
 	
 	if fire-hook "save-qcow2-file"; then
 		if [[ -n "${QCOW2_FILE}" ]]; then
+			inform "saving QCOW2: ${QCOW2_FILE}"
 			qemu-img convert -c -p -f raw -O qcow2 "${device}" "${QCOW2_FILE}"
 		fi
 	fi
@@ -734,12 +754,13 @@ function print-config() {
 }
 
 ## HERE IS WHERE THE ACTION BEGINS!!!! - everything above is just setting things up
-while getopts "e:hCsc:d:vV" flag; do
+while getopts "e:hCIsc:d:vV" flag; do
 	case "${flag}" in
 		h ) print-help; exit 0;;
 		c ) declare -rx config_file="${OPTARG}"; [[ "${0}" -ef "${OPTARG}" ]] && die "${OPTARG} is not a config file";; # (error check the mistake I keep making)
 		C ) declare -rx config_only=true;; # can't do it now because need to wait and see if config file is also provided
 		d ) declare -x default_debug="${OPTARG}";;
+		I ) declare -rx auto_install=true;;
 		s ) declare -x init_system=true;; # this is not well implemented, and dependencies are discussed in the help, so probably delete this altogether
 		e ) declare -x err_cmd="${OPTARG}";;
 		v ) declare -x err_cmd="bash"; default_debug="verbose";;
