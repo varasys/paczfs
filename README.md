@@ -22,7 +22,7 @@ To create an image using default settings run the following (but don't run it ye
 ```
 If any dependancies are not installed, you will be prompted for confirmation to install them (use the `-I` option to suppress the prompt).
 
-This will create an image file named "paczfs-${SUFFIX}.img" (where the `SUFFIX=$( date +%s)` to act as a sort of timestamp) which will be a 20 GB sparse file (using about 900MB actual space). 
+Not including download time this should take between two and five minutes on an average laptop to create an image file named "paczfs-${SUFFIX}.img" (where the `SUFFIX=$( date +%s)` to act as a sort of timestamp) which will be a 20 GB sparse file (using about 900MB actual space).
 
 A customized image file can be created by specifying a configuration file to do things such as copy ssh keys, change keyboard layouts, create VDI, QCOW, or QCOW2 images or to write the image directly to a block device (such as directly to a hard drive) instead of a file.
 
