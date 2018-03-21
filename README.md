@@ -118,7 +118,7 @@ When this script creates the original zfs pool it sets the following property on
 
 - bootfs=${POOL_NAME}/system/default
 
-and sets the following defaults for all datasets created on the pool:
+and sets the following defaults for the ${POOL_NAME}/system dataset (so all children of ${POOL_NAME}/system will inherit these by defualt):
 
 - mountpoint=legacy
 - canmount=noauto
@@ -131,7 +131,7 @@ On the other hand, if the "mountpoint" property is set to a valid mountpoint, th
 
 In a typical installation the "zfs-import.target" "zfs-import-cache.service" and "zfs-import-scan.service" systemd unit files are required to import the pools, but in this case, these operations are performed during early boot (as described below), so these these unit files are not enabled by default.
 
-The two other zfs systemd unit files which are not enabled by default are the "zfs-share.service" and "zfs-zed.service", but you can enable them if needed. Note that the "zfs.target" unit is enabled by default.
+The two other zfs systemd unit files which are not enabled by default are the "zfs-share.service" (we are trying to start with a locked-down system) and "zfs-zed.service", but you can enable them if needed. Note that the "zfs.target" unit is enabled by default so you can use it in a systemd service unit file "Before=" or "After=" clause.
 
 So, in summary:
 - if "mountpoint=legacy" the /etc/fstab file will be used to determine whether/where to mount the dataset at startup
@@ -141,13 +141,13 @@ Note that the system will complain buring boot (and probably have some failed sy
 
 Everything described above is valid for all systems with zfs regardless of whether they use a zfs root filesystem. To use zfs as the root filesystem we need to add the zfs kernel modules and startup script to the initram filesystem (which is temporary ram based root filesystem in used to initialize the real root filesystem).
 
-Think about it this way; the zfs kernel modules are stored on the root filesystem, so how can be they be loaded into the kernel before the root filesystem is mounted; but how can the root filesystem be mounted if the kernel doesn't have the zfs kernel drivers?
+Think about it this way; the zfs kernel modules are stored on the root filesystem, so how can be they be loaded into the kernel before the root filesystem is mounted; but how can the root filesystem be mounted if the kernel doesn't have the zfs kernel drivers needed to mount the root filesystem?
 
-The solution is for the kernel to first mount a temporary ram based filesystem which includes whatever modules and scripts are required to mount the real root filesystem, and then pivot to the real root filesystem. This temporary filesystem is stored in an image file in the EFI partition which is formatted with fat32 which the kernel can read without special help.
+The solution is for the kernel to first mount a small temporary ram based filesystem prepared in advance which includes whatever modules and scripts are required to mount the real root filesystem, and then pivot to the real root filesystem. This temporary filesystem is created by the `mkinitcpio` command in the "prepare-initramfs" section of this script and stored in an image file in the EFI partition which is formatted with fat32 which the kernel can read without special help.
 
 Using an initramfs during bootup is normal and not specific to zfs, but to use zfs as the root filesystem we need to make sure that the kernel modules and zfs initialization script are included correctly in the initramfs image.
 
-The "magic" which actually loads the zfs drivers, imports the zpool, and mounts the selected root filesystem dataset (according to the zpool "bootfs" property) at boot time is the "zfs" script in the hooks directory of the initramfs image created by `mkinitcpio`. This script is copied to the initramfs from /usr/lib/initcpio/hooks/zfs.
+The "magic" which actually loads the zfs drivers, imports the zpool, and mounts the selected root filesystem dataset (according to the zpool "bootfs" property) at boot time is the "zfs" script in the hooks directory of the initramfs image created by `mkinitcpio`. This script is copied to the initramfs from /usr/lib/initcpio/hooks/zfs. In the "prepare-initramfs" section of this script we modify the /etc/initcpio.conf file to include the zfs drivers in the image and the zfs "hook" script.
 
 When the zfs script is executed early in the boot process it makes decisions about how to mount the root filesystem based on the kernel arguments passed by grub.
  
@@ -155,11 +155,13 @@ The script uses logic to provide several ways to specify how to select a zfs roo
 
 The default ArchLinux zfs installation tries to use the "root=ZFS=pool/dataset" method, but in the "install-grub" section of the script we use `sed` to change this to the "zfs=bootfs" method. The reason is because we want to be able to use the zpool "bootfs" property to select a root filesystem (instead of having to edit grub configuration files). This is probably something that would be better configured in grub, but we don't really understand grub, and it looks too complicated to make the investment because we think there is a way to eliminate grub from the boot process and be able to dynamically (and with some level of intelligence) select from all available root filesystem datasets.
 
-The only problem with the "zfs=bootfs" method is that the default initramfs zfs scripts performs  a check to make sure the /etc/fstab on the initramfs contains an entry for each dataset with the "mountpoint" property set to "legacy" before mounting it. Although this is a reasonable check, for our use case it is not appropriate. There is a `sed` command in the "prepare-initramfs" section of the `paczfs` script which modifies the zfs initialization script to short circuit this check (so you won't need to update the initramfs /etc/initfs for each dataset that you want to be able to boot into).
+The only problem with the "zfs=bootfs" method is that the default initramfs zfs scripts performs  a check to make sure the /etc/fstab on the initramfs contains an entry for each dataset with the "mountpoint" property set to "legacy" before mounting it. Although this is a reasonable check (and conforms to the idea that all "legacy" mounts are meant to be included in an /etc/fstab file), unfortunately, for our use case it is not appropriate. There is a `sed` command in the "prepare-initramfs" section of the `paczfs` script which modifies the zfs initialization script to short circuit this check. This is so we don't need to add each potential root filesystem to the /boot/etc/fstab (we think this is where it would go) file (which is normally mounted read-only).
 
 Note that it is important for only one zpool to have the "bootfs" property set, because the default zfs initramfs script tries to mount the "bootfs" on the first pool detected that has one.
 
 If there is a problem mounting the root filesystem you will drop into a shell with some basic tools you can use to try and troubleshoot the problem (including the `zpool` and `zfs` programs).
+
+After getting more experience using zfs as a root filesystem, we expect to prepare a simplified (but very focused) zfs early boot hook script. Ultimately we believe that using the right combination of holds and a simple intelligent startup script we can achieve some pretty interesting results.
 
 # What is the Point (short answer)
 
