@@ -54,7 +54,23 @@ If the CACHE_PATH variable has a colon ":" then `sshfs` will be used to mount it
 
 If you haven't used ArchLinux before it is important to understand that this script is very deliberately designed to install the smallest practical (but useful) system possible as a base so you can have total control over anything extra, so lots of what you are used to probably won't be installed by default (but is most likely available).
 
-For example, unless you explicitly install them, the `shutdown` and `reboot` commands aren't available (so use `systemctl poweroff` and `systemctl reboot` instead). It is a bit frustrating at first, but is ultimately very useful because it forces you to understand which tools you are actually using (since sometimes packages try and maintain consistency to use sym-links or other compatibility tricks that obfuscate what is really happening).
+For example, unless you explicitly install the "bash-completions" package (which is included in the zroot/system/workstation dataset but not the zroot/system/bootable dataset), the `shutdown` and `reboot` commands aren't available (so use `systemctl poweroff` and `systemctl reboot` instead). It is a bit frustrating at first, but is ultimately very useful because it forces you to understand which tools you are actually using (since sometimes packages try and maintain consistency to use sym-links or other compatibility tricks that obfuscate what is really happening).
+
+But the `pacman` package manager and `systemd-nspawn` are a very powerful combination. For example, the following snippet will create a nginx container and run it with `systemd-nspawn` such that it is accessable on host port 443 (of course you still have to provide the nginx.conf file and web content).
+
+```
+zfs clone zroot/data/machines/miniroot zroot/data/machines/nginx
+systemd-nspawn -M nginx \
+    --bind=/var/cache/pacman/pkg \
+    --bind=/run/systemd/resolve/stub-resolv.conf \
+    sh -c "pacman -S --needed --noconfirm nginx && systemctl enable nginx.service"
+cp -r /var/lib/machines/nginx/etc/nginx /srv/nginx
+systemd-nspawn -b -M nginx --bind-ro=/srv/nginx:/etc/nginx --network-veth --port=tcp:443
+```
+
+If you run this on a server booted from an image made from this script it will clone the miniroot into a container, install the packages into the container (using the package cache on the host), copy the default nginx configuration from the container image to a "data" directory in the /srv directory, then boot into the container start listening on host port 443 and present a login prompt. You can login with the username "root" and no password (unless you some customization was performed to disable empty password login) and then run `systemctl status ngninx` and confirm that nginx is running along with the minimal set systemd services.
+
+You can use a systemd service unit file start this container at boot. 
 
 The environment variable WORKSTATION_PKGS defines a list of packages we have chosen to add to the image in addition to the ArchLinux base package (things we consider to be core packages). Feel free to customize per your liking.
 
@@ -121,9 +137,7 @@ So, in summary:
 - if "mountpoint=legacy" the /etc/fstab file will be used to determine whether/where to mount the dataset at startup
 - if the "mountpoint" property is set to a valid path, and "canmount=on" the dataset will be mounted by the "zfs-mount.service" at startup
 
-By default, this script sets the default "mountpoint" property of the pool to "legacy", which means that all zfs datasets inherit it and mounts are performed using the /etc/fstab file in whatever root filesystem was booted into. It is important to understand that if you clone a root filesystem and then boot into it the reason it will have all the same mounts is because the /etc/fstab file was included in the clone. If the clone should have different mounts edit the /etc/fstab file in the clone as required.
-
-On the other hand, if you set the "mountpoint" property of a dataset to a valid path and set "canmount=on" the dataset will be mounted when you boot into any root filesystem that has the "zfs-mount.service" enabled.
+Note that the system will complain buring boot (and probably have some failed systemd units) if any of the normal mount rules are violated (such as having an /etc/fstab entry for a dataset that does not have it's "mountpoint" property set to a valid path, or attempting to mount something to a non-empty mountpoint). So it is important to adopt a clear strategy for whatever your use case is.
 
 Everything described above is valid for all systems with zfs regardless of whether they use a zfs root filesystem. To use zfs as the root filesystem we need to add the zfs kernel modules and startup script to the initram filesystem (which is temporary ram based root filesystem in used to initialize the real root filesystem).
 
@@ -133,17 +147,17 @@ The solution is for the kernel to first mount a temporary ram based filesystem w
 
 Using an initramfs during bootup is normal and not specific to zfs, but to use zfs as the root filesystem we need to make sure that the kernel modules and zfs initialization script are included correctly in the initramfs image.
 
-The "magic" which actually loads the zfs drivers, imports the zpool, and mounts the selected root filesystem dataset (according to the zpool "bootfs" property) at boot time is the "zfs" script in the hooks directory of the initramfs image created by `mkinitcpio`. This operation is performed in the "prepare-initramfs" section of the script and includes copying the script located at /usr/lib/initcpio/hooks/zfs into the initramfs.
+The "magic" which actually loads the zfs drivers, imports the zpool, and mounts the selected root filesystem dataset (according to the zpool "bootfs" property) at boot time is the "zfs" script in the hooks directory of the initramfs image created by `mkinitcpio`. This script is copied to the initramfs from /usr/lib/initcpio/hooks/zfs.
 
-This script uses logic to provide several ways to specify how to select a zfs root filestem using various linux kernel arguments (ie. zfs=auto, zfs=bootfs, root=ZFS=, etc). Type `mkinitcpio --hookhelp zfs` (on a machine that has the mkinitcpio and zfs packages installed) to see the various options that can be appended to the linux command line (in /etc/default/grub).
+When the zfs script is executed early in the boot process it makes decisions about how to mount the root filesystem based on the kernel arguments passed by grub.
+ 
+The script uses logic to provide several ways to specify how to select a zfs root filestem using various linux kernel arguments (ie. zfs=auto, zfs=bootfs, root=ZFS=, etc). Type `mkinitcpio --hookhelp zfs` (on a machine that has the mkinitcpio and zfs packages installed) to see the various options that can be appended to the linux command line (in /etc/default/grub).
 
-The default ArchLinux zfs installation tries to use the "root=ZFS=pool/dataset" method, but in the "install-grub" section of the script we use `sed` to change this to the "zfs=bootfs" method. The reason is because we want to be able to use the zpool "bootfs" property to select a root filesystem (instead of having to edit grub configuration files).
+The default ArchLinux zfs installation tries to use the "root=ZFS=pool/dataset" method, but in the "install-grub" section of the script we use `sed` to change this to the "zfs=bootfs" method. The reason is because we want to be able to use the zpool "bootfs" property to select a root filesystem (instead of having to edit grub configuration files). This is probably something that would be better configured in grub, but we don't really understand grub, and it looks too complicated to make the investment because we think there is a way to eliminate grub from the boot process and be able to dynamically (and with some level of intelligence) select from all available root filesystem datasets.
 
 The only problem with the "zfs=bootfs" method is that the default initramfs zfs scripts performs  a check to make sure the /etc/fstab on the initramfs contains an entry for each dataset with the "mountpoint" property set to "legacy" before mounting it. Although this is a reasonable check, for our use case it is not appropriate. There is a `sed` command in the "prepare-initramfs" section of the `paczfs` script which modifies the zfs initialization script to short circuit this check (so you won't need to update the initramfs /etc/initfs for each dataset that you want to be able to boot into).
 
-In summary, if you are happy to control everything using the "/etc/fstab" file in each root filesystem everything should already be set-up (just change the zpool "bootfs" property and reboot). If you want to try something else, hopefully this explanation provides a good explanation of the starting point used by the `paczfs` script.
-
-Note that it is important for only one zpool to have the "bootfs" property set, because the default zfs initramfs scripts try to mount the "bootfs" on the first pool detected that has one.
+Note that it is important for only one zpool to have the "bootfs" property set, because the default zfs initramfs script tries to mount the "bootfs" on the first pool detected that has one.
 
 If there is a problem mounting the root filesystem you will drop into a shell with some basic tools you can use to try and troubleshoot the problem (including the `zpool` and `zfs` programs).
 

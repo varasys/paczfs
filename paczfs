@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-#TODO remove all systemd calls on host
-
 ## this script is hosted at https://github.com/varasys/paczfs
 
 ## execute script with "-h" option for a description of the purpose
@@ -314,7 +312,7 @@ function create-image() {
 	declare -rx ZPOOL_VDEV_NAME_PATH=1 # if this is 1 the zfs command will output full device paths (instead of just device names)
 	if fire-hook "prepare-zfs-pool"; then
 		zpool create -R "${CHROOT_PATH}" -O "relatime=on" -O "compression=lz4" -O "acltype=posixacl" \
-			-O "xattr=sa" -o "ashift=12" -O "mountpoint=legacy" -O "canmount=noauto" "${POOL_NAME}" "${zfs_loop_dev}"
+			-O "xattr=sa" -o "ashift=12" "${POOL_NAME}" "${zfs_loop_dev}"
 		add-tear-down "zpool export ${POOL_NAME}"
 		declare -rx zfs_id=$( zpool get -H -o "value" "guid" "${POOL_NAME}" )
 		zpool export "${POOL_NAME}"
@@ -328,21 +326,14 @@ function create-image() {
 	if fire-hook "prepare-directories"; then
 		add-tear-down "umount -R ${CHROOT_PATH}"
 		
+		zfs create -p -o "mountpoint=legacy" "${POOL_NAME}/system"
 		zfs create -p "${POOL_NAME}/system/default"; mount -t zfs "${POOL_NAME}/system/default" "${CHROOT_PATH}/"
-		zfs create -p "${POOL_NAME}/data"
-		mkdir -p "${CHROOT_PATH}/root"
-		zfs create -p "${POOL_NAME}/data/root"; mount -t zfs "${POOL_NAME}/data/root" "${CHROOT_PATH}/root"
-		chmod 750 "${CHROOT_PATH}/root"
-		mkdir -p "${CHROOT_PATH}/home"
-		zfs create -p "${POOL_NAME}/data/home"; mount -t zfs "${POOL_NAME}/data/home" "${CHROOT_PATH}/home"
-		mkdir -p "${CHROOT_PATH}/srv"
-		zfs create -p "${POOL_NAME}/data/srv"; mount -t zfs "${POOL_NAME}/data/srv" "${CHROOT_PATH}/srv"
-		mkdir -p "${CHROOT_PATH}/var/lib/machines"
-		zfs create -p -o "recordsize=8K" -o "primarycache=metadata" -o "logbias=throughput" "${POOL_NAME}/data/machines"
-			mount -t zfs "${POOL_NAME}/data/machines" "${CHROOT_PATH}/var/lib/machines"
-		mkdir -p "${CHROOT_PATH}/var/lib/postgres"
-		zfs create -p -o "recordsize=8K" -o "primarycache=metadata" -o "logbias=throughput" "${POOL_NAME}/data/postgres"
-			mount -t zfs "${POOL_NAME}/data/postgres" "${CHROOT_PATH}/var/lib/postgres"
+		zfs create -p -o "mountpoint=none" "${POOL_NAME}/data"
+		zfs create -p -o "mountpoint=/root" "${POOL_NAME}/data/root"
+		zfs create -p -o "mountpoint=/home" "${POOL_NAME}/data/home"
+		zfs create -p -o "mountpoint=/srv" "${POOL_NAME}/data/srv"
+		zfs create -p -o "mountpoint=/var/lib/machines" -o "recordsize=8K" -o "primarycache=metadata" -o "logbias=throughput" "${POOL_NAME}/data/machines"
+		zfs create -p -o "mountpoint=/var/lib/postgres" -o "recordsize=8K" -o "primarycache=metadata" -o "logbias=throughput" "${POOL_NAME}/data/postgres"
 		
 		zpool set bootfs="${POOL_NAME}/system/default" "${POOL_NAME}"
 
@@ -429,7 +420,6 @@ function create-image() {
 			[Network]
 			DHCP=v4
 			EOF
-		arch-chroot "${CHROOT_PATH}" sh -c "cat '/proc/mounts' | awk '\$1 ~ \"^${POOL_NAME}/\" && \$2 != \"/\" { print }' >> '/etc/fstab'"
 	fi
 
 	if fire-hook "set-locale"; then
@@ -450,7 +440,7 @@ function create-image() {
 	fi
 
 	if fire-hook "prepare-users"; then
-		:
+		: # chmod 750 "${CHROOT_PATH}/root"
 	fi
 
 	if fire-hook "populate-mirrorlist"; then
@@ -458,7 +448,9 @@ function create-image() {
 	fi
 
 	if fire-hook "snapshot-miniroot"; then
+		rm "${CHROOT_PATH}/etc/machine-id"
 		zfs snapshot -r "${POOL_NAME}@${hook##*-}"
+		zfs clone -o "readonly=on" "${POOL_NAME}/system/default@${hook##*-}" "${POOL_NAME}/data/machines/${hook##*-}"
 		zfs hold -r "io.varasys.${name}" "${POOL_NAME}@${hook##*-}"
 	fi
 
@@ -497,6 +489,7 @@ function create-image() {
 			arch-chroot "${CHROOT_PATH}" systemctl enable "zfs-mount.service" >&${verbose_fd}
 			arch-chroot "${CHROOT_PATH}" systemctl enable "zfs.target" >&${verbose_fd}
 		fi
+		#arch-chroot "${CHROOT_PATH}" sh -c "cat '/proc/mounts' | awk '\$1 ~ \"^${POOL_NAME}/\" && \$2 != \"/\" { print }' >> '/etc/fstab'"
 	fi
 
 	if fire-hook "prepare-initramfs"; then
@@ -523,8 +516,7 @@ function create-image() {
 
 	if fire-hook "snapshot-bootable"; then
 		zfs snapshot -r "${POOL_NAME}@${hook##*-}"
-		zfs clone "${POOL_NAME}/system/default@${hook##*-}" "${POOL_NAME}/system/restore"
-		zfs set readonly="on" "${POOL_NAME}/system/restore"
+		zfs clone "${POOL_NAME}/system/default@${hook##*-}" "${POOL_NAME}/system/${hook##*-}"
 		zfs hold -r "io.varasys.${name}" "${POOL_NAME}@${hook##*-}"
 	fi
 
@@ -535,14 +527,16 @@ function create-image() {
 
 	if fire-hook "snapshot-workstation"; then
 		zfs snapshot -r "${POOL_NAME}@${hook##*-}"
+		zfs clone "${POOL_NAME}/system/default@${hook##*-}" "${POOL_NAME}/system/${hook##*-}"
 		zfs hold -r "io.varasys.${name}" "${POOL_NAME}@${hook##*-}"
+	fi
+
+	if fire-hook "finalize-image"; then
+		:
 	fi
 
 	if fire-hook "clean-up"; then
 		tear-down
-	fi
-
-	if fire-hook "finalize-image"; then
 		congrats "Finished creating ${name} image on ${device}"
 	fi
 
@@ -599,7 +593,7 @@ function initialize() {
 	local -ra default_locales=( 'en_US.UTF-8 UTF-8' )
 	local -ra default_base_exclude_pkgs=( linux )
 	local -ra default_bootable_pkgs=( zfs-linux-hardened grub-efi-$( uname -m ) efibootmgr rng-tools openssh ntp )
-	local -ra default_workstation_pkgs=( rsync vim htop iftop tmux pv sshfs gdisk qemu-headless pkgfile arch-install-scripts dosfstools parted ovmf )
+	local -ra default_workstation_pkgs=( rsync vim htop iftop tmux pv sshfs gdisk qemu-headless pkgfile arch-install-scripts dosfstools parted ovmf bash-completion )
 	declare -gxA config_vars=( ) # associative array to store strings to print in config file (unevaluated)
 	local var_name=
 	var_name=CONFIG_VERSION
@@ -679,7 +673,14 @@ function print-config() {
 				snapshot-miniroot) cat <<-EOF
 					## uncomment the following to change the default keyboard layout (adapt as needed)
 					# ${1} () {
-					#     arch-chroot "${CHROOT_PATH}" systemd-firstboot --keymap=dvorak
+					#     arch-chroot "\${CHROOT_PATH}" systemd-firstboot --keymap=dvorak
+					# }
+					EOF
+					;;
+				finalize-image) cat <<-EOF
+					## uncomment and adjust the following to use a different default root filesystem dataset
+					# ${1} () {
+					#     zpool set bootfs="${POOL_NAME}/system/bootable" "\${POOL_NAME}"
 					# }
 					EOF
 					;;
